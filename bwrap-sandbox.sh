@@ -19,19 +19,40 @@ declare -A MOUNT_PERMS=()       # Path -> "ro" | "rw" (Last profile wins)
 ORDERED_MOUNT_PATHS=()          # Preserves registration order
 ENABLE_FILTERED_DBUS=false      # Enabled if requested by any active profile
 
-# Cleanup tracker for proxy
+# Cleanup tracker for proxy and sandbox processes
 PROXY_PID=""
 PROXY_DIR=""
+BWRAP_PID=""
 
 cleanup() {
+    local sig="${1:-0}"
+    trap - EXIT INT TERM HUP
+
+    if [ -n "$BWRAP_PID" ]; then
+        kill "$BWRAP_PID" 2>/dev/null || true
+        wait "$BWRAP_PID" 2>/dev/null || true
+        BWRAP_PID=""
+    fi
+
     if [ -n "$PROXY_PID" ]; then
         kill "$PROXY_PID" 2>/dev/null || true
+        wait "$PROXY_PID" 2>/dev/null || true
+        PROXY_PID=""
     fi
+
     if [ -n "$PROXY_DIR" ] && [ -d "$PROXY_DIR" ]; then
         rm -rf "$PROXY_DIR"
+        PROXY_DIR=""
+    fi
+
+    if [ "$sig" -ne 0 ]; then
+        kill -s "$sig" $$ 2>/dev/null || exit $((128 + sig))
     fi
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup 0' EXIT
+trap 'cleanup 2' INT
+trap 'cleanup 15' TERM
+trap 'cleanup 1' HUP
 
 # ------------------------------------------------------------------------------
 # Mount Helper Function
@@ -320,11 +341,15 @@ if [ "$ENABLE_FILTERED_DBUS" = true ]; then
             xdg-dbus-proxy "unix:path=$HOST_BUS" "$PROXY_BUS" \
                 --filter \
                 --talk=org.freedesktop.secrets \
-                --talk=org.gnome.keyring &
+                --talk=org.gnome.keyring </dev/null &
             PROXY_PID=$!
 
             # Wait until proxy socket is created to prevent race conditions
             while [ ! -S "$PROXY_BUS" ]; do
+                if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+                    echo "Error: Failed to start xdg-dbus-proxy." >&2
+                    exit 1
+                fi
                 sleep 0.02
             done
 
@@ -369,5 +394,10 @@ fi
 # ------------------------------------------------------------------------------
 # Execution
 # ------------------------------------------------------------------------------
-exec bwrap "${BWRAP_ARGS[@]}" "${BWRAP_ENV[@]}" "${COMMAND[@]}" || EXIT_CODE=$?
+EXIT_CODE=0
+bwrap "${BWRAP_ARGS[@]}" "${BWRAP_ENV[@]}" "${COMMAND[@]}" <&0 &
+BWRAP_PID=$!
+wait "$BWRAP_PID" 2>/dev/null || EXIT_CODE=$?
+BWRAP_PID=""
+
 exit "${EXIT_CODE:-0}"
