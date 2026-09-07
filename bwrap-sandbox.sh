@@ -1,19 +1,31 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Security-Hardened Bubblewrap Sandbox for AI Coding Agents (e.g., Antigravity)
+# Security-Hardened Bubblewrap Sandbox for AI Coding Agents
 # ==============================================================================
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
-# Default Settings
+# Default Settings & State
 # ------------------------------------------------------------------------------
 ALLOW_NET=false
 TARGET_DIR="$(pwd)"
+PROFILE=""
 COMMAND=()
+
+AVAILABLE_PROFILES=("antigravity" "claude" "none")
 
 # ------------------------------------------------------------------------------
 # Help & Usage
 # ------------------------------------------------------------------------------
+list_profiles() {
+    cat <<EOF
+Available Agent Profiles:
+  antigravity    Mounts ~/.antigravity and ~/.gemini (read-write if present)
+  claude         Mounts ~/.claude and ~/.claude.json (read-write if present)
+  none           No agent-specific files or directories mounted (default)
+EOF
+}
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS] [-- COMMAND [ARGS...]]
@@ -21,15 +33,17 @@ Usage: $(basename "$0") [OPTIONS] [-- COMMAND [ARGS...]]
 A security-hardened Bubblewrap sandbox for AI coding agents.
 
 Options:
+  -p, --profile NAME   Agent permission profile (Options: antigravity, claude, none)
+      --list-profiles  List available permission profiles and descriptions
   -n, --net            Allow network access (Default: OFF / isolated)
   -d, --dir PATH       Target workspace directory (Default: current directory)
   -h, --help           Show this help message
 
 Examples:
-  $(basename "$0")                                # Open interactive bash (offline)
-  $(basename "$0") --net                          # Open interactive bash with internet
-  $(basename "$0") -- antigravity                 # Run Antigravity CLI offline
-  $(basename "$0") --net -- antigravity           # Run Antigravity CLI with internet
+  $(basename "$0") --list-profiles
+  $(basename "$0") -p antigravity -- antigravity
+  $(basename "$0") -p claude --net -- claude
+  $(basename "$0") --net                                # Interactive bash without profile
 EOF
     exit 0
 }
@@ -39,6 +53,14 @@ EOF
 # ------------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
+    -p | --profile)
+        PROFILE="$2"
+        shift 2
+        ;;
+    --list-profiles)
+        list_profiles
+        exit 0
+        ;;
     -n | --net)
         ALLOW_NET=true
         shift
@@ -61,6 +83,23 @@ while [[ $# -gt 0 ]]; do
         ;;
     esac
 done
+
+# Validate selected profile
+if [ -n "$PROFILE" ]; then
+    PROFILE_VALID=false
+    for valid_profile in "${AVAILABLE_PROFILES[@]}"; do
+        if [ "$PROFILE" = "$valid_profile" ]; then
+            PROFILE_VALID=true
+            break
+        fi
+    done
+
+    if [ "$PROFILE_VALID" = false ]; then
+        echo "Error: Invalid profile '$PROFILE'." >&2
+        echo "Valid profiles: ${AVAILABLE_PROFILES[*]}" >&2
+        exit 1
+    fi
+fi
 
 # Resolve absolute path for workspace
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd -P)"
@@ -125,7 +164,6 @@ BWRAP_ARGS+=(
 # ------------------------------------------------------------------------------
 DETECTED_USER_PATHS=()
 
-# Common user-level runtime and package manager locations
 USER_TOOLS=(
     ".local/bin"
     ".cargo/bin"
@@ -153,6 +191,35 @@ CLEAN_PATH="$(
     IFS=:
     echo "${DETECTED_USER_PATHS[*]}"
 ):/usr/local/bin:/usr/bin:/bin"
+
+# ------------------------------------------------------------------------------
+# Agent Permission Profiles
+# Conditionally exposes configuration and state files/directories per agent
+# ------------------------------------------------------------------------------
+PROFILE_PATHS=()
+
+case "$PROFILE" in
+    antigravity)
+        PROFILE_PATHS=(
+            "$HOME/.antigravity"
+            "$HOME/.gemini"
+        )
+        ;;
+    claude)
+        PROFILE_PATHS=(
+            "$HOME/.claude"
+            "$HOME/.claude.json"
+        )
+        ;;
+    none|"")
+        ;;
+esac
+
+for target_path in "${PROFILE_PATHS[@]}"; do
+    if [ -e "$target_path" ]; then
+        BWRAP_ARGS+=("--bind" "$target_path" "$target_path")
+    fi
+done
 
 # ------------------------------------------------------------------------------
 # Workspace Security: Mount Project & Defend Git Hooks
