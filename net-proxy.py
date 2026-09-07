@@ -92,13 +92,17 @@ class FilteringProxyServer:
                         break
 
                 if not is_domain_allowed(host, self.patterns):
+                    body = f"Blocked by sandbox filter: {host}\n"
+                    body_bytes = body.encode("utf-8")
                     resp = (
-                        f"HTTP/1.1 403 Forbidden\r\n"
-                        f"Content-Type: text/plain\r\n"
+                        f"HTTP/1.1 403 Blocked by sandbox filter: {host}\r\n"
+                        f"Content-Type: text/plain; charset=utf-8\r\n"
+                        f"Content-Length: {len(body_bytes)}\r\n"
+                        f"X-Blocked-By: sandbox-filter\r\n"
+                        f"X-Blocked-Domain: {host}\r\n"
                         f"Connection: close\r\n\r\n"
-                        f"Blocked by sandbox filter: {host}\n"
                     )
-                    client_w.write(resp.encode("utf-8"))
+                    client_w.write(resp.encode("utf-8") + body_bytes)
                     await client_w.drain()
                     client_w.close()
                     return
@@ -106,13 +110,15 @@ class FilteringProxyServer:
                 try:
                     remote_r, remote_w = await asyncio.open_connection(host, port)
                 except Exception as e:
+                    body = f"Failed to connect to {host}:{port}: {e}\n"
+                    body_bytes = body.encode("utf-8")
                     resp = (
                         f"HTTP/1.1 502 Bad Gateway\r\n"
-                        f"Content-Type: text/plain\r\n"
+                        f"Content-Type: text/plain; charset=utf-8\r\n"
+                        f"Content-Length: {len(body_bytes)}\r\n"
                         f"Connection: close\r\n\r\n"
-                        f"Failed to connect to {host}:{port}: {e}\n"
                     )
-                    client_w.write(resp.encode("utf-8"))
+                    client_w.write(resp.encode("utf-8") + body_bytes)
                     await client_w.drain()
                     client_w.close()
                     return
@@ -141,13 +147,18 @@ class FilteringProxyServer:
                     host = target[7:].split("/", 1)[0]
 
                 if not host or not is_domain_allowed(host, self.patterns):
+                    blocked_host = host or "unknown"
+                    body = f"Blocked by sandbox filter: {blocked_host}\n"
+                    body_bytes = body.encode("utf-8")
                     resp = (
-                        f"HTTP/1.1 403 Forbidden\r\n"
-                        f"Content-Type: text/plain\r\n"
+                        f"HTTP/1.1 403 Blocked by sandbox filter: {blocked_host}\r\n"
+                        f"Content-Type: text/plain; charset=utf-8\r\n"
+                        f"Content-Length: {len(body_bytes)}\r\n"
+                        f"X-Blocked-By: sandbox-filter\r\n"
+                        f"X-Blocked-Domain: {blocked_host}\r\n"
                         f"Connection: close\r\n\r\n"
-                        f"Blocked by sandbox filter: {host or 'unknown'}\n"
                     )
-                    client_w.write(resp.encode("utf-8"))
+                    client_w.write(resp.encode("utf-8") + body_bytes)
                     await client_w.drain()
                     client_w.close()
                     return
@@ -164,13 +175,15 @@ class FilteringProxyServer:
                 try:
                     remote_r, remote_w = await asyncio.open_connection(host, port)
                 except Exception as e:
+                    body = f"Failed to connect to {host}:{port}: {e}\n"
+                    body_bytes = body.encode("utf-8")
                     resp = (
                         f"HTTP/1.1 502 Bad Gateway\r\n"
-                        f"Content-Type: text/plain\r\n"
+                        f"Content-Type: text/plain; charset=utf-8\r\n"
+                        f"Content-Length: {len(body_bytes)}\r\n"
                         f"Connection: close\r\n\r\n"
-                        f"Failed to connect to {host}:{port}: {e}\n"
                     )
-                    client_w.write(resp.encode("utf-8"))
+                    client_w.write(resp.encode("utf-8") + body_bytes)
                     await client_w.drain()
                     client_w.close()
                     return
