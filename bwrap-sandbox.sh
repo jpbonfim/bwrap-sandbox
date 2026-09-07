@@ -9,10 +9,89 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 ALLOW_NET=false
 TARGET_DIR="$(pwd)"
-PROFILE=""
+SELECTED_PROFILES=()
 COMMAND=()
 
-AVAILABLE_PROFILES=("antigravity" "claude" "none")
+AVAILABLE_PROFILES=("dev-tools" "antigravity" "claude" "none")
+
+# Data structures for profile mounts & permissions
+declare -A MOUNT_PERMS=()       # Path -> "ro" | "rw" (Last profile wins)
+ORDERED_MOUNT_PATHS=()          # Preserves registration order
+ENABLE_FILTERED_DBUS=false      # Enabled if requested by any active profile
+
+# Cleanup tracker for proxy
+PROXY_PID=""
+PROXY_DIR=""
+
+cleanup() {
+    if [ -n "$PROXY_PID" ]; then
+        kill "$PROXY_PID" 2>/dev/null || true
+    fi
+    if [ -n "$PROXY_DIR" ] && [ -d "$PROXY_DIR" ]; then
+        rm -rf "$PROXY_DIR"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# ------------------------------------------------------------------------------
+# Mount Helper Function
+# ------------------------------------------------------------------------------
+# Usage: set_mount <"ro"|"rw"> <path>
+set_mount() {
+    local mode="$1"
+    local path="$2"
+
+    if [ -e "$path" ]; then
+        if [ -z "${MOUNT_PERMS["$path"]:-}" ]; then
+            ORDERED_MOUNT_PATHS+=("$path")
+        fi
+        MOUNT_PERMS["$path"]="$mode"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Profile Definitions
+# ------------------------------------------------------------------------------
+apply_profile() {
+    local profile="$1"
+    case "$profile" in
+        dev-tools)
+            set_mount "ro" "$HOME/.local/bin"
+            set_mount "ro" "$HOME/.cargo/bin"
+            set_mount "ro" "$HOME/.nvm"
+            set_mount "ro" "$HOME/.asdf"
+            set_mount "ro" "$HOME/.pyenv"
+            set_mount "ro" "$HOME/.rustup"
+            set_mount "ro" "$HOME/.fnm"
+            set_mount "ro" "$HOME/.volta"
+            set_mount "ro" "$HOME/.bun/bin"
+            set_mount "ro" "$HOME/go/bin"
+            ;;
+
+        antigravity)
+            set_mount "rw" "$HOME/.antigravity"
+            set_mount "rw" "$HOME/.gemini"
+            ENABLE_FILTERED_DBUS=true
+            ;;
+
+        claude)
+            set_mount "rw" "$HOME/.claude"
+            set_mount "rw" "$HOME/.claude.json"
+            set_mount "rw" "$HOME/.config/claude"
+            set_mount "rw" "$HOME/.local/share/claude"
+            set_mount "rw" "$HOME/.local/state/claude"
+            ;;
+
+        none)
+            ;;
+
+        *)
+            echo "Error: Unknown profile '$profile'." >&2
+            echo "Available profiles: ${AVAILABLE_PROFILES[*]}" >&2
+            exit 1
+            ;;
+    esac
+}
 
 # ------------------------------------------------------------------------------
 # Help & Usage
@@ -20,9 +99,13 @@ AVAILABLE_PROFILES=("antigravity" "claude" "none")
 list_profiles() {
     cat <<EOF
 Available Agent Profiles:
-  antigravity    Mounts ~/.antigravity and ~/.gemini (read-write if present)
-  claude         Mounts ~/.claude and ~/.claude.json (read-write if present)
-  none           No agent-specific files or directories mounted (default)
+  dev-tools      Mounts host user toolchains (~/.cargo/bin, ~/.nvm, ~/.pyenv, etc.) [Read-Only]
+  antigravity    Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache [RO], and filters D-Bus Keyring
+  claude         Mounts ~/.claude, ~/.claude.json, and ~/.config/claude [Read-Write]
+  none           No extra mounts applied (default)
+
+Note: You can pass multiple profiles (e.g. -p dev-tools -p antigravity).
+      If path permissions conflict, the last profile specified takes precedence.
 EOF
 }
 
@@ -33,7 +116,7 @@ Usage: $(basename "$0") [OPTIONS] [-- COMMAND [ARGS...]]
 A security-hardened Bubblewrap sandbox for AI coding agents.
 
 Options:
-  -p, --profile NAME   Agent permission profile (Options: antigravity, claude, none)
+  -p, --profile NAME   Permission profile (Can be repeated or comma-separated)
       --list-profiles  List available permission profiles and descriptions
   -n, --net            Allow network access (Default: OFF / isolated)
   -d, --dir PATH       Target workspace directory (Default: current directory)
@@ -41,9 +124,8 @@ Options:
 
 Examples:
   $(basename "$0") --list-profiles
-  $(basename "$0") -p antigravity -- antigravity
-  $(basename "$0") -p claude --net -- claude
-  $(basename "$0") --net                                # Interactive bash without profile
+  $(basename "$0") -p dev-tools,antigravity --net -- agy
+  $(basename "$0") -p dev-tools,claude --net -- claude
 EOF
     exit 0
 }
@@ -54,7 +136,10 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
     -p | --profile)
-        PROFILE="$2"
+        IFS=',' read -ra SPLIT_PROFILES <<< "$2"
+        for p in "${SPLIT_PROFILES[@]}"; do
+            SELECTED_PROFILES+=("$p")
+        done
         shift 2
         ;;
     --list-profiles)
@@ -84,23 +169,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Validate selected profile
-if [ -n "$PROFILE" ]; then
-    PROFILE_VALID=false
-    for valid_profile in "${AVAILABLE_PROFILES[@]}"; do
-        if [ "$PROFILE" = "$valid_profile" ]; then
-            PROFILE_VALID=true
-            break
-        fi
-    done
-
-    if [ "$PROFILE_VALID" = false ]; then
-        echo "Error: Invalid profile '$PROFILE'." >&2
-        echo "Valid profiles: ${AVAILABLE_PROFILES[*]}" >&2
-        exit 1
-    fi
-fi
-
 # Resolve absolute path for workspace
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd -P)"
 
@@ -116,7 +184,7 @@ if ! command -v bwrap >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------------------
-# Core Security Configurations & Edge Cases
+# Core Security Configurations & Base Mounts
 # ------------------------------------------------------------------------------
 BWRAP_ARGS=(
     # 1. Process & Kernel Isolation
@@ -159,30 +227,24 @@ BWRAP_ARGS+=(
 )
 
 # ------------------------------------------------------------------------------
-# Host Toolchain Detection & Safe Mapping
-# Expose user-installed compilers/runtimes without exposing sensitive files
+# Apply Selected Profiles & Build Path Mounts
 # ------------------------------------------------------------------------------
+for profile in "${SELECTED_PROFILES[@]}"; do
+    apply_profile "$profile"
+done
+
 DETECTED_USER_PATHS=()
 
-USER_TOOLS=(
-    ".local/bin"
-    ".cargo/bin"
-    ".nvm"
-    ".asdf"
-    ".pyenv"
-    ".rustup"
-    ".fnm"
-    ".volta"
-    ".bun/bin"
-    "go/bin"
-)
+for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
+    mode="${MOUNT_PERMS["$target_path"]}"
+    if [ "$mode" = "rw" ]; then
+        BWRAP_ARGS+=("--bind" "$target_path" "$target_path")
+    elif [ "$mode" = "ro" ]; then
+        BWRAP_ARGS+=("--ro-bind" "$target_path" "$target_path")
+    fi
 
-for tool in "${USER_TOOLS[@]}"; do
-    if [ -d "$HOME/$tool" ]; then
-        BWRAP_ARGS+=("--ro-bind" "$HOME/$tool" "$HOME/$tool")
-        if [[ "$tool" == *"bin"* ]]; then
-            DETECTED_USER_PATHS+=("$HOME/$tool")
-        fi
+    if [[ "$target_path" == *"bin"* && -d "$target_path" ]]; then
+        DETECTED_USER_PATHS+=("$target_path")
     fi
 done
 
@@ -191,35 +253,6 @@ CLEAN_PATH="$(
     IFS=:
     echo "${DETECTED_USER_PATHS[*]}"
 ):/usr/local/bin:/usr/bin:/bin"
-
-# ------------------------------------------------------------------------------
-# Agent Permission Profiles
-# Conditionally exposes configuration and state files/directories per agent
-# ------------------------------------------------------------------------------
-PROFILE_PATHS=()
-
-case "$PROFILE" in
-    antigravity)
-        PROFILE_PATHS=(
-            "$HOME/.antigravity"
-            "$HOME/.gemini"
-        )
-        ;;
-    claude)
-        PROFILE_PATHS=(
-            "$HOME/.claude"
-            "$HOME/.claude.json"
-        )
-        ;;
-    none|"")
-        ;;
-esac
-
-for target_path in "${PROFILE_PATHS[@]}"; do
-    if [ -e "$target_path" ]; then
-        BWRAP_ARGS+=("--bind" "$target_path" "$target_path")
-    fi
-done
 
 # ------------------------------------------------------------------------------
 # Workspace Security: Mount Project & Defend Git Hooks
@@ -256,7 +289,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Clean Environment Variables (Anti-Leakage)
+# Base Environment Sanitization (--clearenv must be first!)
 # ------------------------------------------------------------------------------
 BWRAP_ENV=(
     "--clearenv"
@@ -271,7 +304,48 @@ BWRAP_ENV=(
     "--setenv" "GIT_CONFIG_PARAMETERS" "'core.hooksPath=/dev/null'"
 )
 
-# If network is enabled, forward AI API keys for the coding agent
+# ------------------------------------------------------------------------------
+# Secure D-Bus Filtering via xdg-dbus-proxy (Appended AFTER --clearenv)
+# ------------------------------------------------------------------------------
+if [ "$ENABLE_FILTERED_DBUS" = true ]; then
+    USER_UID="$(id -u)"
+    HOST_BUS="/run/user/$USER_UID/bus"
+
+    if [ -S "$HOST_BUS" ]; then
+        if command -v xdg-dbus-proxy >/dev/null 2>&1; then
+            PROXY_DIR="$(mktemp -d /tmp/bwrap-dbus-XXXXXX)"
+            PROXY_BUS="$PROXY_DIR/bus"
+
+            # Proxy Keyring and Secret Service APIs; block host systemd1
+            xdg-dbus-proxy "unix:path=$HOST_BUS" "$PROXY_BUS" \
+                --filter \
+                --talk=org.freedesktop.secrets \
+                --talk=org.gnome.keyring &
+            PROXY_PID=$!
+
+            # Wait until proxy socket is created to prevent race conditions
+            while [ ! -S "$PROXY_BUS" ]; do
+                sleep 0.02
+            done
+
+            BWRAP_ARGS+=(
+                "--dir" "/run/user/$USER_UID"
+                "--bind" "$PROXY_BUS" "/run/user/$USER_UID/bus"
+            )
+            BWRAP_ENV+=(
+                "--setenv" "XDG_RUNTIME_DIR" "/run/user/$USER_UID"
+                "--setenv" "DBUS_SESSION_BUS_ADDRESS" "unix:path=/run/user/$USER_UID/bus"
+            )
+        else
+            echo "Warning: 'xdg-dbus-proxy' is not installed. D-Bus filtering disabled." >&2
+            echo "Run: sudo apt install xdg-dbus-proxy" >&2
+        fi
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# AI Keys Forwarding (Appended AFTER --clearenv)
+# ------------------------------------------------------------------------------
 if [ "$ALLOW_NET" = true ]; then
     AI_KEYS=(
         "ANTHROPIC_API_KEY"
@@ -295,4 +369,5 @@ fi
 # ------------------------------------------------------------------------------
 # Execution
 # ------------------------------------------------------------------------------
-exec bwrap "${BWRAP_ARGS[@]}" "${BWRAP_ENV[@]}" "${COMMAND[@]}"
+exec bwrap "${BWRAP_ARGS[@]}" "${BWRAP_ENV[@]}" "${COMMAND[@]}" || EXIT_CODE=$?
+exit "${EXIT_CODE:-0}"
