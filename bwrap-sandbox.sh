@@ -8,11 +8,16 @@ set -euo pipefail
 # Default Settings & State
 # ------------------------------------------------------------------------------
 ALLOW_NET=false
+ALLOW_NET_FILTERED=false
+WHITELIST_FILE=""
 TARGET_DIR="$(pwd)"
 SELECTED_PROFILES=()
 COMMAND=()
 
 AVAILABLE_PROFILES=("dev-tools" "antigravity" "claude" "none")
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+DEFAULT_WHITELIST="$SCRIPT_DIR/allowed-domains.txt"
 
 # Data structures for profile mounts & permissions
 declare -A MOUNT_PERMS=()       # Path -> "ro" | "rw" (Last profile wins)
@@ -22,6 +27,9 @@ ENABLE_FILTERED_DBUS=false      # Enabled if requested by any active profile
 # Cleanup tracker for proxy and sandbox processes
 PROXY_PID=""
 PROXY_DIR=""
+NET_PROXY_PID=""
+NET_PROXY_DIR=""
+SANDBOX_RUNTIME_DIR=""
 BWRAP_PID=""
 
 cleanup() {
@@ -43,6 +51,22 @@ cleanup() {
     if [ -n "$PROXY_DIR" ] && [ -d "$PROXY_DIR" ]; then
         rm -rf "$PROXY_DIR"
         PROXY_DIR=""
+    fi
+
+    if [ -n "$NET_PROXY_PID" ]; then
+        kill "$NET_PROXY_PID" 2>/dev/null || true
+        wait "$NET_PROXY_PID" 2>/dev/null || true
+        NET_PROXY_PID=""
+    fi
+
+    if [ -n "$NET_PROXY_DIR" ] && [ -d "$NET_PROXY_DIR" ]; then
+        rm -rf "$NET_PROXY_DIR"
+        NET_PROXY_DIR=""
+    fi
+
+    if [ -n "$SANDBOX_RUNTIME_DIR" ] && [ -d "$SANDBOX_RUNTIME_DIR" ]; then
+        rm -rf "$SANDBOX_RUNTIME_DIR"
+        SANDBOX_RUNTIME_DIR=""
     fi
 
     if [ "$sig" -ne 0 ]; then
@@ -92,6 +116,8 @@ apply_profile() {
         antigravity)
             set_mount "rw" "$HOME/.antigravity"
             set_mount "rw" "$HOME/.gemini"
+            set_mount "ro" "$HOME/.cache/ms-playwright-go"
+            set_mount "ro" "$HOME/.cache/ms-playwright"
             ENABLE_FILTERED_DBUS=true
             ;;
 
@@ -137,16 +163,20 @@ Usage: $(basename "$0") [OPTIONS] [-- COMMAND [ARGS...]]
 A security-hardened Bubblewrap sandbox for AI coding agents.
 
 Options:
-  -p, --profile NAME   Permission profile (Can be repeated or comma-separated)
-      --list-profiles  List available permission profiles and descriptions
-  -n, --net            Allow network access (Default: OFF / isolated)
-  -d, --dir PATH       Target workspace directory (Default: current directory)
-  -h, --help           Show this help message
+  -p, --profile NAME       Permission profile (Can be repeated or comma-separated)
+      --list-profiles      List available permission profiles and descriptions
+  -n, --net                Allow unrestricted network access (Default: OFF / isolated)
+  -nf, --net-filtered      Allow domain-filtered network access via strict proxy
+  -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
+  -d, --dir PATH           Target workspace directory (Default: current directory)
+  -h, --help               Show this help message
 
 Examples:
   $(basename "$0") --list-profiles
-  $(basename "$0") -p dev-tools,antigravity --net -- agy
-  $(basename "$0") -p dev-tools,claude --net -- claude
+  $(basename "$0") -p dev-tools,antigravity -nf -- agy
+  $(basename "$0") -p dev-tools,claude -nf -- claude
+  $(basename "$0") -p dev-tools,claude -nf -w ./my-domains.txt -- claude
+  $(basename "$0") -p dev-tools --net -- cargo build
 EOF
     exit 0
 }
@@ -171,6 +201,14 @@ while [[ $# -gt 0 ]]; do
         ALLOW_NET=true
         shift
         ;;
+    -nf | --net-filtered)
+        ALLOW_NET_FILTERED=true
+        shift
+        ;;
+    -w | --whitelist)
+        WHITELIST_FILE="$2"
+        shift 2
+        ;;
     -d | --dir)
         TARGET_DIR="$2"
         shift 2
@@ -189,6 +227,20 @@ while [[ $# -gt 0 ]]; do
         ;;
     esac
 done
+
+# Validate network exclusivity
+if [ "$ALLOW_NET" = true ] && [ "$ALLOW_NET_FILTERED" = true ]; then
+    echo "Error: Cannot specify both '--net' (unrestricted) and '--net-filtered' (domain-filtered)." >&2
+    exit 1
+fi
+
+if [ "$ALLOW_NET_FILTERED" = true ]; then
+    WHITELIST_FILE="${WHITELIST_FILE:-$DEFAULT_WHITELIST}"
+    if [ ! -f "$WHITELIST_FILE" ]; then
+        echo "Error: Whitelist file not found: '$WHITELIST_FILE'" >&2
+        exit 1
+    fi
+fi
 
 # Resolve absolute path for workspace
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd -P)"
@@ -238,8 +290,21 @@ for sysdir in /bin /sbin /lib /lib64; do
     fi
 done
 
+# Ephemeral sandbox runtime files (clean /etc/hosts with IPv4 & IPv6 loopback)
+SANDBOX_RUNTIME_DIR="$(mktemp -d /tmp/bwrap-rt-XXXXXX)"
+chmod 0755 "$SANDBOX_RUNTIME_DIR"
+
+HOST_NAME="$(hostname 2>/dev/null || echo "sandbox")"
+cat <<EOF > "$SANDBOX_RUNTIME_DIR/hosts"
+127.0.0.1 localhost $HOST_NAME
+::1 localhost ip6-localhost ip6-loopback
+EOF
+chmod 0644 "$SANDBOX_RUNTIME_DIR/hosts"
+
 # Essential system configuration (read-only)
 BWRAP_ARGS+=(
+    "--ro-bind" "$SANDBOX_RUNTIME_DIR/hosts" "/etc/hosts"
+    "--ro-bind-try" "/etc/nsswitch.conf" "/etc/nsswitch.conf"
     "--ro-bind-try" "/etc/alternatives" "/etc/alternatives"
     "--ro-bind-try" "/etc/ssl" "/etc/ssl"
     "--ro-bind-try" "/etc/pki" "/etc/pki"
@@ -312,6 +377,11 @@ fi
 # ------------------------------------------------------------------------------
 # Base Environment Sanitization (--clearenv must be first!)
 # ------------------------------------------------------------------------------
+GIT_CONFIG_OVERRIDE="'core.hooksPath=/dev/null'"
+if [ "$ALLOW_NET_FILTERED" = true ]; then
+    GIT_CONFIG_OVERRIDE="$GIT_CONFIG_OVERRIDE 'url.https://github.com/.insteadOf=git@github.com:' 'url.https://gitlab.com/.insteadOf=git@gitlab.com:'"
+fi
+
 BWRAP_ENV=(
     "--clearenv"
     "--setenv" "USER" "${USER:-sandbox}"
@@ -322,7 +392,7 @@ BWRAP_ENV=(
     "--setenv" "LANG" "${LANG:-C.UTF-8}"
     "--setenv" "LC_ALL" "${LC_ALL:-C.UTF-8}"
     # Global Git override: force Git to ignore local hooks even if created elsewhere
-    "--setenv" "GIT_CONFIG_PARAMETERS" "'core.hooksPath=/dev/null'"
+    "--setenv" "GIT_CONFIG_PARAMETERS" "$GIT_CONFIG_OVERRIDE"
 )
 
 # ------------------------------------------------------------------------------
@@ -369,9 +439,64 @@ if [ "$ENABLE_FILTERED_DBUS" = true ]; then
 fi
 
 # ------------------------------------------------------------------------------
+# Secure Domain-Filtered Network Proxy (Option B)
+# ------------------------------------------------------------------------------
+SANDBOX_PROXY_PORT=18080
+SANDBOX_NET_DIR=""
+SANDBOX_NET_SOCK=""
+SANDBOX_NET_RELAY=""
+
+if [ "$ALLOW_NET_FILTERED" = true ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Error: 'python3' is required for network filtering proxy." >&2
+        exit 1
+    fi
+
+    USER_UID="$(id -u)"
+    NET_PROXY_DIR="$(mktemp -d /tmp/bwrap-net-XXXXXX)"
+    chmod 0700 "$NET_PROXY_DIR"
+    NET_PROXY_SOCK="$NET_PROXY_DIR/proxy.sock"
+
+    # Start domain-filtering proxy on the host listening directly on Unix socket
+    python3 "$SCRIPT_DIR/net-proxy.py" --proxy "$NET_PROXY_SOCK" "$WHITELIST_FILE" </dev/null >/dev/null 2>&1 &
+    NET_PROXY_PID=$!
+
+    # Wait until proxy socket is created to prevent race conditions
+    while [ ! -S "$NET_PROXY_SOCK" ]; do
+        if ! kill -0 "$NET_PROXY_PID" 2>/dev/null; then
+            echo "Error: Failed to start domain-filtering network proxy." >&2
+            exit 1
+        fi
+        sleep 0.02
+    done
+
+    # Mount proxy socket and relay helper inside sandbox
+    SANDBOX_NET_DIR="/run/user/$USER_UID/net"
+    SANDBOX_NET_SOCK="$SANDBOX_NET_DIR/proxy.sock"
+    SANDBOX_NET_RELAY="$SANDBOX_NET_DIR/net-proxy.py"
+
+    BWRAP_ARGS+=(
+        "--dir" "/run/user/$USER_UID"
+        "--dir" "$SANDBOX_NET_DIR"
+        "--ro-bind" "$NET_PROXY_SOCK" "$SANDBOX_NET_SOCK"
+        "--ro-bind" "$SCRIPT_DIR/net-proxy.py" "$SANDBOX_NET_RELAY"
+    )
+
+    BWRAP_ENV+=(
+        "--setenv" "HTTP_PROXY" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
+        "--setenv" "HTTPS_PROXY" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
+        "--setenv" "ALL_PROXY" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
+        "--setenv" "http_proxy" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
+        "--setenv" "https_proxy" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
+        "--setenv" "NO_PROXY" "localhost,127.0.0.1,::1"
+        "--setenv" "no_proxy" "localhost,127.0.0.1,::1"
+    )
+fi
+
+# ------------------------------------------------------------------------------
 # AI Keys Forwarding (Appended AFTER --clearenv)
 # ------------------------------------------------------------------------------
-if [ "$ALLOW_NET" = true ]; then
+if [ "$ALLOW_NET" = true ] || [ "$ALLOW_NET_FILTERED" = true ]; then
     AI_KEYS=(
         "ANTHROPIC_API_KEY"
         "OPENAI_API_KEY"
@@ -394,8 +519,30 @@ fi
 # ------------------------------------------------------------------------------
 # Execution
 # ------------------------------------------------------------------------------
+if [ "$ALLOW_NET_FILTERED" = true ]; then
+    INNER_WRAPPER='
+        if command -v socat >/dev/null 2>&1; then
+            socat TCP-LISTEN:'"$SANDBOX_PROXY_PORT"',bind=127.0.0.1,fork UNIX-CONNECT:"'"$SANDBOX_NET_SOCK"'" >/dev/null 2>&1 &
+        else
+            python3 "'"$SANDBOX_NET_RELAY"'" --relay '"$SANDBOX_PROXY_PORT"' "'"$SANDBOX_NET_SOCK"'" >/dev/null 2>&1 &
+        fi
+        RELAY_PID=$!
+        while ! (echo > /dev/tcp/127.0.0.1/'"$SANDBOX_PROXY_PORT"') 2>/dev/null; do
+            if ! kill -0 "$RELAY_PID" 2>/dev/null; then
+                echo "Error: Failed to start sandbox network relay." >&2
+                exit 1
+            fi
+            sleep 0.01
+        done
+        exec "$@"
+    '
+    FINAL_CMD=("/bin/bash" "-c" "$INNER_WRAPPER" "--" "${COMMAND[@]}")
+else
+    FINAL_CMD=("${COMMAND[@]}")
+fi
+
 EXIT_CODE=0
-bwrap "${BWRAP_ARGS[@]}" "${BWRAP_ENV[@]}" "${COMMAND[@]}" <&0 &
+bwrap "${BWRAP_ARGS[@]}" "${BWRAP_ENV[@]}" "${FINAL_CMD[@]}" <&0 &
 BWRAP_PID=$!
 wait "$BWRAP_PID" 2>/dev/null || EXIT_CODE=$?
 BWRAP_PID=""

@@ -1,0 +1,99 @@
+# ==============================================================================
+# Security-Hardened Sandbox: Default Allowed Domains Whitelist
+# ==============================================================================
+# Format: One domain pattern per line.
+# Supports shell glob wildcards (*.domain.com).
+# Lines starting with '#' and empty lines are ignored.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Anthropic & Claude Code
+# ------------------------------------------------------------------------------
+api.anthropic.com
+*.anthropic.com
+claude.ai
+*.claude.ai
+statsig.anthropic.com
+statsigapi.net
+*.statsigapi.net
+sentry.io
+*.sentry.io
+
+# ------------------------------------------------------------------------------
+# 2. Google Gemini & Antigravity
+# ------------------------------------------------------------------------------
+accounts.google.com
+oauth2.googleapis.com
+generativelanguage.googleapis.com
+cloudresourcemanager.googleapis.com
+googleapis.com
+*.googleapis.com
+www.googleapis.com
+firebase.googleapis.com
+identitytoolkit.googleapis.com
+lh3.googleusercontent.com
+
+
+# ------------------------------------------------------------------------------
+# 3. OpenAI, DeepSeek, Groq & Mistral (Major LLM APIs)
+# ------------------------------------------------------------------------------
+api.openai.com
+*.openai.com
+api.deepseek.com
+*.deepseek.com
+api.groq.com
+*.groq.com
+api.mistral.ai
+*.mistral.ai
+
+# ------------------------------------------------------------------------------
+# 4. GitHub & GitLab (Source Control, Releases, Assets & Raw Files)
+# ------------------------------------------------------------------------------
+github.com
+*.github.com
+api.github.com
+raw.githubusercontent.com
+objects.githubusercontent.com
+codeload.github.com
+github-releases.githubusercontent.com
+gist.github.com
+gitlab.com
+*.gitlab.com
+
+# ------------------------------------------------------------------------------
+# 5. Package Registries & Language Ecosystems
+# ------------------------------------------------------------------------------
+# Node.js / NPM / Yarn
+registry.npmjs.org
+*.npmjs.org
+registry.yarnpkg.com
+*.yarnpkg.com
+
+# Python / PyPI
+pypi.org
+*.pypi.org
+files.pythonhosted.org
+*.pythonhosted.org
+pypi.python.org
+
+# Rust / Cargo
+crates.io
+*.crates.io
+static.crates.io
+index.crates.io
+
+# Go
+proxy.golang.org
+sum.golang.org
+
+# ------------------------------------------------------------------------------
+# 6. Common CDNs & Headless Browser Runtimes
+# ------------------------------------------------------------------------------
+# Playwright (used by Antigravity and automated test suites)
+playwright.azureedge.net
+*.playwright.dev
+
+# Popular Web CDNs
+cdn.jsdelivr.net
+unpkg.com
+cdnjs.cloudflare.com
