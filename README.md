@@ -91,7 +91,6 @@ Supported directives:
 * `env = <NAME|PATTERN_*>`: Environment variable(s) to forward from the host. Supports wildcards (e.g., `ANTIGRAVITY_*`). Repeatable.
 * `dbus_auth = true|false`: Enables filtered D-Bus proxy access to Secret Service / Keyring tokens (`org.freedesktop.secrets`, `org.gnome.keyring`).
 * `dbus_notifications = true|false`: Enables filtered D-Bus proxy access to desktop notifications (`org.freedesktop.Notifications`).
-* `filtered_dbus = true|false`: Legacy alias for `dbus_auth`.
 
 **Example custom profile:**
 ```ini

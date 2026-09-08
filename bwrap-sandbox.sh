@@ -293,9 +293,6 @@ apply_profile_from_config() {
                 ENABLE_DBUS_AUTH=true
             elif [[ "$line" =~ ^dbus_notifications[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
                 ENABLE_DBUS_NOTIFICATIONS=true
-            elif [[ "$line" =~ ^filtered_dbus[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
-                # Legacy alias for dbus_auth
-                ENABLE_DBUS_AUTH=true
             fi
         fi
     done < "$file"
