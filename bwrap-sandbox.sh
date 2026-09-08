@@ -9,6 +9,7 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 ALLOW_NET=false
 ALLOW_NET_FILTERED=false
+ALLOW_GUI=false
 WHITELIST_FILE=""
 TARGET_DIR="$(pwd)"
 SELECTED_PROFILES=()
@@ -398,6 +399,7 @@ Options:
       --init               Initialize profiles.conf and allowed-domains.txt from templates and exit
   -n, --net                Allow unrestricted network access (Default: OFF / isolated)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
+  -g, --gui                Expose X11/Wayland display and clipboard (Warning: reduces isolation)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
   -h, --help               Show this help message
@@ -405,6 +407,7 @@ Options:
 Examples:
   $(basename "$0") --init
   $(basename "$0") --list-profiles
+  $(basename "$0") -p dev-tools,antigravity -nf -g -- agy
   $(basename "$0") -p dev-tools,antigravity -nf -- agy
   $(basename "$0") -p dev-tools,claude -nf -- claude
   $(basename "$0") -p dev-tools,claude -nf -w ./my-domains.txt -- claude
@@ -493,6 +496,10 @@ while [[ $# -gt 0 ]]; do
         ;;
     -nf | --net-filtered)
         ALLOW_NET_FILTERED=true
+        shift
+        ;;
+    -g | --gui)
+        ALLOW_GUI=true
         shift
         ;;
     -w | --whitelist)
@@ -841,6 +848,55 @@ if [ "$ALLOW_NET_FILTERED" = true ]; then
         "--setenv" "NO_PROXY" "$SANDBOX_NO_PROXY"
         "--setenv" "no_proxy" "$SANDBOX_NO_PROXY"
     )
+fi
+
+# ------------------------------------------------------------------------------
+# GUI & Clipboard Support (--gui)
+# ------------------------------------------------------------------------------
+if [ "$ALLOW_GUI" = true ]; then
+    HAS_GUI_DISPLAY=false
+
+    # 1. Wayland Display Server
+    WAYLAND_SOCK=""
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        WAYLAND_SOCK="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+    elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "${XDG_RUNTIME_DIR:-}/wayland-0" ]; then
+        WAYLAND_DISPLAY="wayland-0"
+        WAYLAND_SOCK="$XDG_RUNTIME_DIR/wayland-0"
+    fi
+
+    if [ -n "$WAYLAND_SOCK" ] && [ -S "$WAYLAND_SOCK" ]; then
+        USER_UID="$(id -u)"
+        BWRAP_ARGS+=(
+            "--dir" "/run/user/$USER_UID"
+            "--bind" "$WAYLAND_SOCK" "/run/user/$USER_UID/$WAYLAND_DISPLAY"
+        )
+        BWRAP_ENV+=(
+            "--setenv" "WAYLAND_DISPLAY" "$WAYLAND_DISPLAY"
+            "--setenv" "XDG_RUNTIME_DIR" "/run/user/$USER_UID"
+        )
+        HAS_GUI_DISPLAY=true
+    fi
+
+    # 2. X11 Display Server
+    if [ -n "${DISPLAY:-}" ]; then
+        if [ -d "/tmp/.X11-unix" ]; then
+            BWRAP_ARGS+=("--bind" "/tmp/.X11-unix" "/tmp/.X11-unix")
+            BWRAP_ENV+=("--setenv" "DISPLAY" "$DISPLAY")
+            HAS_GUI_DISPLAY=true
+
+            # Forward XAUTHORITY if present, or fallback to ~/.Xauthority
+            HOST_XAUTH="${XAUTHORITY:-$HOME/.Xauthority}"
+            if [ -f "$HOST_XAUTH" ]; then
+                BWRAP_ARGS+=("--ro-bind" "$HOST_XAUTH" "$HOST_XAUTH")
+                BWRAP_ENV+=("--setenv" "XAUTHORITY" "$HOST_XAUTH")
+            fi
+        fi
+    fi
+
+    if [ "$HAS_GUI_DISPLAY" = false ]; then
+        echo "Warning: '--gui' was specified, but no active X11 or Wayland display was detected on the host." >&2
+    fi
 fi
 
 # ------------------------------------------------------------------------------

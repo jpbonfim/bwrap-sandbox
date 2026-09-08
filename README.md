@@ -122,12 +122,19 @@ Options:
       --init               Initialize profiles.conf and allowed-domains.txt from templates and exit
   -n, --net                Allow unrestricted network access (Default: OFF / isolated)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
+  -g, --gui                Expose X11/Wayland display and clipboard (Warning: reduces isolation)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
   -h, --help               Show this help message
 ```
 
 The `--` delimiter separates script options from the command passed to the sandbox.
+
+> [!WARNING]
+> **Security Implications of `--gui`:**
+> Enabling GUI access (`-g, --gui`) forwards your host's X11 and/or Wayland display server and clipboard into the sandbox. This enables pasting images from the clipboard into terminal agents (e.g., `agy`), running headed browsers (`headless: false` in Playwright), and viewing graphical plots.
+>
+> However, **the legacy X11 protocol does not isolate clients**. On native X11 desktops, any process inside the sandbox could theoretically monitor host keystrokes (keylogging), capture screenshots of other windows, or inject synthetic input events into host terminals. Wayland provides strong per-client isolation and prevents these cross-client attacks. Only enable `--gui` when you explicitly require graphical or clipboard capabilities.
 
 ---
 
@@ -175,7 +182,14 @@ When downloading from unwhitelisted package repositories or running unrestricted
 
 ```bash
 ./bwrap-sandbox.sh -p dev-tools --net -- cargo build
+```
 
+### 6. Run Antigravity CLI with GUI & Clipboard Support
+
+Run Antigravity with domain-filtered internet and GUI display enabled (allowing pasting clipboard images directly into the CLI via `Ctrl+V`, headed browser tests, etc.):
+
+```bash
+./bwrap-sandbox.sh -p dev-tools,antigravity -nf -g -- agy
 ```
 
 ---
