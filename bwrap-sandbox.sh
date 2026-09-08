@@ -78,7 +78,8 @@ SELECTED_ENV_PATTERNS=()
 # Data structures for profile mounts & permissions
 declare -A MOUNT_PERMS=()       # Path -> "ro" | "rw" (Last profile wins)
 ORDERED_MOUNT_PATHS=()          # Preserves registration order
-ENABLE_FILTERED_DBUS=false      # Enabled if requested by any active profile
+ENABLE_DBUS_AUTH=false          # Enabled if requested by any active profile (Keyring/Secrets)
+ENABLE_DBUS_NOTIFICATIONS=false # Enabled if requested by any active profile (Desktop notifications)
 
 # Cleanup tracker for proxy and sandbox processes
 PROXY_PID=""
@@ -218,7 +219,7 @@ load_available_profiles() {
     if [ ! -f "$file" ]; then
         AVAILABLE_PROFILES=("dev-tools" "antigravity" "claude" "openai" "deepseek" "mistral" "groq" "none")
         PROFILE_DESCRIPTIONS["dev-tools"]="Mounts host user toolchains (~/.cargo/bin, ~/.nvm, ~/.pyenv, etc.) [Read-Only]"
-        PROFILE_DESCRIPTIONS["antigravity"]="Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache [RO], and filters D-Bus Keyring"
+        PROFILE_DESCRIPTIONS["antigravity"]="Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache [RO], and filters D-Bus Keyring/Notifications"
         PROFILE_DESCRIPTIONS["claude"]="Mounts ~/.claude, ~/.claude.json, and ~/.config/claude [Read-Write]"
         PROFILE_DESCRIPTIONS["openai"]="Forwards OpenAI API credentials"
         PROFILE_DESCRIPTIONS["deepseek"]="Forwards DeepSeek API credentials"
@@ -288,8 +289,13 @@ apply_profile_from_config() {
                 env_pat="${env_pat#"${env_pat%%[![:space:]]*}"}"
                 env_pat="${env_pat%"${env_pat##*[![:space:]]}"}"
                 SELECTED_ENV_PATTERNS+=("$env_pat")
+            elif [[ "$line" =~ ^dbus_auth[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
+                ENABLE_DBUS_AUTH=true
+            elif [[ "$line" =~ ^dbus_notifications[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
+                ENABLE_DBUS_NOTIFICATIONS=true
             elif [[ "$line" =~ ^filtered_dbus[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
-                ENABLE_FILTERED_DBUS=true
+                # Legacy alias for dbus_auth
+                ENABLE_DBUS_AUTH=true
             fi
         fi
     done < "$file"
@@ -318,7 +324,8 @@ apply_profile_fallback() {
             set_mount "ro" "$HOME/.cache/ms-playwright-go"
             set_mount "ro" "$HOME/.cache/ms-playwright"
             SELECTED_ENV_PATTERNS+=("GEMINI_API_KEY" "ANTIGRAVITY_*")
-            ENABLE_FILTERED_DBUS=true
+            ENABLE_DBUS_AUTH=true
+            ENABLE_DBUS_NOTIFICATIONS=true
             ;;
         claude)
             set_mount "rw" "$HOME/.claude"
@@ -746,7 +753,7 @@ BWRAP_ENV=(
 # ------------------------------------------------------------------------------
 # Secure D-Bus Filtering via xdg-dbus-proxy (Appended AFTER --clearenv)
 # ------------------------------------------------------------------------------
-if [ "$ENABLE_FILTERED_DBUS" = true ]; then
+if [ "$ENABLE_DBUS_AUTH" = true ] || [ "$ENABLE_DBUS_NOTIFICATIONS" = true ]; then
     USER_UID="$(id -u)"
     HOST_BUS="/run/user/$USER_UID/bus"
 
@@ -755,11 +762,27 @@ if [ "$ENABLE_FILTERED_DBUS" = true ]; then
             PROXY_DIR="$(mktemp -d /tmp/bwrap-dbus-XXXXXX)"
             PROXY_BUS="$PROXY_DIR/bus"
 
-            # Proxy Keyring and Secret Service APIs; block host systemd1
-            xdg-dbus-proxy "unix:path=$HOST_BUS" "$PROXY_BUS" \
-                --filter \
-                --talk=org.freedesktop.secrets \
-                --talk=org.gnome.keyring </dev/null &
+            PROXY_ARGS=(
+                "unix:path=$HOST_BUS" "$PROXY_BUS"
+                "--filter"
+            )
+
+            # Granular D-Bus filtering: Keyring vs Desktop Notifications
+            if [ "$ENABLE_DBUS_AUTH" = true ]; then
+                PROXY_ARGS+=(
+                    "--talk=org.freedesktop.secrets"
+                    "--talk=org.gnome.keyring"
+                )
+            fi
+
+            if [ "$ENABLE_DBUS_NOTIFICATIONS" = true ]; then
+                PROXY_ARGS+=(
+                    "--talk=org.freedesktop.Notifications"
+                )
+            fi
+
+            # Block systemd and all other host interfaces
+            xdg-dbus-proxy "${PROXY_ARGS[@]}" </dev/null &
             PROXY_PID=$!
 
             # Wait until proxy socket is created to prevent race conditions
