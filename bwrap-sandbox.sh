@@ -490,13 +490,15 @@ fi
 # Resolve absolute path for workspace
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd -P)"
 
-# Guard: Prevent running directly on $HOME or / to avoid unmasking the host system
-if [ "$TARGET_DIR" = "$HOME" ] || [ "$TARGET_DIR" = "/" ]; then
-    echo "Security Error: Running sandbox directly on HOME ('$HOME') or root ('/') is strictly forbidden." >&2
-    echo "This would expose your entire home directory and credentials to the sandbox." >&2
-    echo "Please specify a dedicated project workspace directory via '-d PATH' or run from within a subfolder." >&2
-    exit 1
-fi
+# Guard: Prevent running directly on sensitive system directories or $HOME
+case "$TARGET_DIR" in
+    /|/etc|/etc/*|/usr|/usr/*|/bin|/sbin|/lib*|/boot|/boot/*|/sys|/sys/*|/proc|/proc/*|/dev|/dev/*|/var|/root|"$HOME")
+        echo "Security Error: Running sandbox on system directory or HOME ('$TARGET_DIR') is strictly forbidden." >&2
+        echo "This would expose your host system or credentials to the sandbox." >&2
+        echo "Please specify a dedicated project workspace directory via '-d PATH' or run from within a subfolder." >&2
+        exit 1
+        ;;
+esac
 
 # Default to user's shell or bash if no command specified
 if [ ${#COMMAND[@]} -eq 0 ]; then
@@ -584,16 +586,16 @@ for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
         BWRAP_ARGS+=("--ro-bind" "$target_path" "$target_path")
     fi
 
-    if [[ "$target_path" == *"bin"* && -d "$target_path" ]]; then
+    if [[ ("$target_path" == *"bin"* || "$target_path" == *"shims"*) && -d "$target_path" ]]; then
         DETECTED_USER_PATHS+=("$target_path")
     fi
 done
 
-# Build sanitized PATH
-CLEAN_PATH="$(
-    IFS=:
-    echo "${DETECTED_USER_PATHS[*]}"
-):/usr/local/bin:/usr/bin:/bin"
+# Build sanitized PATH (prevent leading colon which POSIX treats as current working directory)
+CLEAN_PATH="/usr/local/bin:/usr/bin:/bin"
+if [ ${#DETECTED_USER_PATHS[@]} -gt 0 ]; then
+    CLEAN_PATH="$(IFS=:; echo "${DETECTED_USER_PATHS[*]}"):$CLEAN_PATH"
+fi
 
 # ------------------------------------------------------------------------------
 # Workspace Security: Mount Project & Defend Git Hooks
