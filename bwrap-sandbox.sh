@@ -699,14 +699,23 @@ if [ "$ALLOW_NET_FILTERED" = true ]; then
         "--ro-bind" "$SCRIPT_DIR/net-proxy.py" "$SANDBOX_NET_RELAY"
     )
 
+    SANDBOX_NO_PROXY="localhost,127.0.0.1,::1"
+    # If the user explicitly declared localhost/127.0.0.1 rules in the whitelist,
+    # do NOT bypass the proxy for localhost so traffic reaches the filtering proxy!
+    if [ -f "$WHITELIST_FILE" ]; then
+        if grep -Eq '^[[:space:]]*(\*\.)?(localhost|127\.0\.0\.1|::1)' "$WHITELIST_FILE"; then
+            SANDBOX_NO_PROXY=""
+        fi
+    fi
+
     BWRAP_ENV+=(
         "--setenv" "HTTP_PROXY" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
         "--setenv" "HTTPS_PROXY" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
         "--setenv" "ALL_PROXY" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
         "--setenv" "http_proxy" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
         "--setenv" "https_proxy" "http://127.0.0.1:$SANDBOX_PROXY_PORT"
-        "--setenv" "NO_PROXY" "localhost,127.0.0.1,::1"
-        "--setenv" "no_proxy" "localhost,127.0.0.1,::1"
+        "--setenv" "NO_PROXY" "$SANDBOX_NO_PROXY"
+        "--setenv" "no_proxy" "$SANDBOX_NO_PROXY"
     )
 fi
 

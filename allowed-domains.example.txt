@@ -1,10 +1,28 @@
 # ==============================================================================
 # Security-Hardened Sandbox: Default Allowed Domains Whitelist
 # ==============================================================================
-# Format: One domain pattern per line.
+# Format: <domain_or_ip>[:<port_spec>]
 # Supports shell glob wildcards (*.domain.com).
 # Note: '*.domain.com' automatically matches both 'domain.com' and subdomains.
 # Lines starting with '#' and empty lines are ignored.
+#
+# Port Specification Rules:
+#   <domain>                   # If no port is specified, ONLY HTTP/HTTPS (80, 443) are allowed
+#   <domain>:*                 # To allow ALL ports, ':*' must be explicitly specified
+#   <domain>:<port>            # Allow only a specific port (e.g. localhost:11434)
+#   <domain>:<port1>,<port2>   # Allow multiple specific ports (e.g. 127.0.0.1:8000,8080)
+#   <domain>:<start>-<end>     # Allow a port range (e.g. localhost:3000-3010)
+#
+# Examples:
+#   github.com                 # Allows only HTTP (80) and HTTPS (443) for github.com
+#   api.openai.com:443         # Matches specific port 443 only
+#   localhost:11434            # Allow Ollama API running on host machine
+#   localhost:*                # Allow ALL ports on host localhost (requires explicit ':*')
+#   localhost                  # Allows only standard HTTP/HTTPS (80, 443) on host
+#
+# Host Localhost Security Notice:
+#   By default, all traffic to host localhost/127.0.0.1 is blocked.
+#   Only explicitly listed ports for localhost/127.0.0.1 will be accessible.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -82,6 +100,11 @@ hf.co
 # Ollama
 ollama.com
 *.ollama.com
+# Local Ollama / Host APIs (Uncomment and adjust ports as needed):
+# localhost:11434
+# 127.0.0.1:11434
+# localhost:8000,8080
+# localhost:3000-3010
 
 # ------------------------------------------------------------------------------
 # 4. Git & Code Hosting
