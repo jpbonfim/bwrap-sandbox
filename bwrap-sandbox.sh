@@ -462,6 +462,14 @@ fi
 # Resolve absolute path for workspace
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd -P)"
 
+# Guard: Prevent running directly on $HOME or / to avoid unmasking the host system
+if [ "$TARGET_DIR" = "$HOME" ] || [ "$TARGET_DIR" = "/" ]; then
+    echo "Security Error: Running sandbox directly on HOME ('$HOME') or root ('/') is strictly forbidden." >&2
+    echo "This would expose your entire home directory and credentials to the sandbox." >&2
+    echo "Please specify a dedicated project workspace directory via '-d PATH' or run from within a subfolder." >&2
+    exit 1
+fi
+
 # Default to user's shell or bash if no command specified
 if [ ${#COMMAND[@]} -eq 0 ]; then
     COMMAND=("${SHELL:-/bin/bash}")
