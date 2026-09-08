@@ -1,5 +1,5 @@
 # ==============================================================================
-# Git Ignore Configuration for configs-agents
+# Git Ignore Configuration for bwrap-sandbox
 # ==============================================================================
 
 # Python bytecode & cache

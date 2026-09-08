@@ -50,8 +50,8 @@ sudo pacman -S bubblewrap xdg-dbus-proxy socat python
 
 1. Clone or download the repository:
 ```bash
-git clone https://github.com/jpbonfim/configs-agents.git
-cd configs-agents
+git clone https://github.com/jpbonfim/bwrap-sandbox.git
+cd bwrap-sandbox
 chmod +x bwrap-sandbox.sh
 ```
 
