@@ -120,6 +120,8 @@ expand_path() {
         p="$HOME/${p#\~/}"
     elif [[ "$p" == "\$HOME"* ]]; then
         p="$HOME${p#\$HOME}"
+    elif [[ "$p" == "\${HOME}"* ]]; then
+        p="$HOME${p#\$\{HOME\}}"
     fi
     printf "%s\n" "$p"
 }
@@ -222,9 +224,13 @@ apply_profile_from_config() {
                 local raw_path="${BASH_REMATCH[2]}"
                 raw_path="${raw_path#"${raw_path%%[![:space:]]*}"}"
                 raw_path="${raw_path%"${raw_path##*[![:space:]]}"}"
-                local exp_path
-                exp_path="$(expand_path "$raw_path")"
-                set_mount "$mode" "$exp_path"
+                if [ "$mode" != "ro" ] && [ "$mode" != "rw" ]; then
+                    echo "Warning: Invalid mount mode '$mode' in profile '$profile' (expected 'ro' or 'rw'). Skipping." >&2
+                else
+                    local exp_path
+                    exp_path="$(expand_path "$raw_path")"
+                    set_mount "$mode" "$exp_path"
+                fi
             elif [[ "$line" =~ ^env[[:space:]]*=[[:space:]]*(.*)$ ]]; then
                 local env_pat="${BASH_REMATCH[1]}"
                 env_pat="${env_pat#"${env_pat%%[![:space:]]*}"}"
@@ -357,20 +363,26 @@ EOF
 # ------------------------------------------------------------------------------
 # Early Option Handling & Profile Config Loading
 # ------------------------------------------------------------------------------
-# Handle --init early before full option parsing
+# Handle --init early before full option parsing (ignoring anything after --)
 for arg in "$@"; do
+    if [ "$arg" = "--" ]; then
+        break
+    fi
     if [ "$arg" = "--init" ]; then
         ensure_configs true
         exit 0
     fi
 done
 
-# Pre-scan arguments for custom config file
+# Pre-scan arguments for custom config file (ignoring anything after --)
 for ((i=1; i<=$#; i++)); do
+    if [ "${!i}" = "--" ]; then
+        break
+    fi
     case "${!i}" in
         -c|--config)
             next_idx=$((i + 1))
-            if [ $next_idx -le $# ]; then
+            if [ $next_idx -le $# ] && [ "${!next_idx}" != "--" ]; then
                 PROFILES_FILE="${!next_idx}"
             fi
             ;;
@@ -396,6 +408,10 @@ load_available_profiles "$PROFILES_FILE"
 while [[ $# -gt 0 ]]; do
     case "$1" in
     -p | --profile)
+        if [[ $# -lt 2 || "$2" == "--" ]]; then
+            echo "Error: Option '$1' requires an argument." >&2
+            exit 1
+        fi
         IFS=',' read -ra SPLIT_PROFILES <<< "$2"
         for p in "${SPLIT_PROFILES[@]}"; do
             SELECTED_PROFILES+=("$p")
@@ -407,6 +423,10 @@ while [[ $# -gt 0 ]]; do
         exit 0
         ;;
     -c | --config)
+        if [[ $# -lt 2 || "$2" == "--" ]]; then
+            echo "Error: Option '$1' requires an argument." >&2
+            exit 1
+        fi
         PROFILES_FILE="$2"
         shift 2
         ;;
@@ -423,10 +443,18 @@ while [[ $# -gt 0 ]]; do
         shift
         ;;
     -w | --whitelist)
+        if [[ $# -lt 2 || "$2" == "--" ]]; then
+            echo "Error: Option '$1' requires an argument." >&2
+            exit 1
+        fi
         WHITELIST_FILE="$2"
         shift 2
         ;;
     -d | --dir)
+        if [[ $# -lt 2 || "$2" == "--" ]]; then
+            echo "Error: Option '$1' requires an argument." >&2
+            exit 1
+        fi
         TARGET_DIR="$2"
         shift 2
         ;;
