@@ -9,9 +9,12 @@ Modes:
 """
 
 import asyncio
+import ctypes
 import fnmatch
+import ipaddress
 import os
 import signal
+import socket
 import sys
 
 BUFFER_SIZE = 65536
@@ -19,6 +22,51 @@ BUFFER_SIZE = 65536
 
 DEFAULT_HTTP_PORTS = {80, 443}
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def setup_parent_death_signal():
+    """
+    Instructs the Linux kernel to send SIGTERM if the parent process terminates (even on kill -9).
+    Prevents background proxy daemons from becoming orphaned zombies.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+async def resolve_safe_connect_host(host):
+    """
+    Resolves the upstream host and prevents DNS Rebinding and SSRF attacks.
+    - If host is a recognized local alias (localhost, 127.0.0.1, ::1), returns '127.0.0.1'.
+    - If host is an external domain, resolves its DNS addresses and blocks connections
+      if any resolved IP falls into loopback, link-local / cloud metadata (169.254.x.x), or unspecified (0.0.0.0).
+    """
+    if host.lower() in LOCAL_HOSTS:
+        return "127.0.0.1"
+
+    loop = asyncio.get_running_loop()
+    try:
+        addr_info = await loop.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ConnectionError(f"DNS resolution failed for {host}: {e}")
+
+    for item in addr_info:
+        ip_str = item[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if ip.is_loopback:
+            raise PermissionError(f"SSRF/DNS Rebinding blocked: '{host}' resolved to loopback IP ({ip_str})")
+        if ip.is_link_local:
+            raise PermissionError(f"SSRF/DNS Rebinding blocked: '{host}' resolved to link-local/cloud metadata IP ({ip_str})")
+        if ip.is_unspecified:
+            raise PermissionError(f"SSRF/DNS Rebinding blocked: '{host}' resolved to unspecified IP ({ip_str})")
+
+    return host
 
 
 class WhitelistRule:
@@ -204,9 +252,24 @@ class FilteringProxyServer:
                     client_w.close()
                     return
 
-                connect_host = "127.0.0.1" if host.lower() in LOCAL_HOSTS else host
                 try:
+                    connect_host = await resolve_safe_connect_host(host)
                     remote_r, remote_w = await asyncio.open_connection(connect_host, port)
+                except PermissionError as pe:
+                    body = f"Blocked by sandbox security policy: {pe}\n"
+                    body_bytes = body.encode("utf-8")
+                    resp = (
+                        f"HTTP/1.1 403 Forbidden\r\n"
+                        f"Content-Type: text/plain; charset=utf-8\r\n"
+                        f"Content-Length: {len(body_bytes)}\r\n"
+                        f"X-Blocked-By: sandbox-filter\r\n"
+                        f"X-Blocked-Reason: SSRF-DNS-Rebinding\r\n"
+                        f"Connection: close\r\n\r\n"
+                    )
+                    client_w.write(resp.encode("utf-8") + body_bytes)
+                    await client_w.drain()
+                    client_w.close()
+                    return
                 except Exception as e:
                     body = f"Failed to connect to {host}:{port}: {e}\n"
                     body_bytes = body.encode("utf-8")
@@ -276,9 +339,24 @@ class FilteringProxyServer:
                     proto = parts[2] if len(parts) > 2 else "HTTP/1.1"
                     headers[0] = f"{method} {path} {proto}\r\n".encode("utf-8")
 
-                connect_host = "127.0.0.1" if host.lower() in LOCAL_HOSTS else host
                 try:
+                    connect_host = await resolve_safe_connect_host(host)
                     remote_r, remote_w = await asyncio.open_connection(connect_host, port)
+                except PermissionError as pe:
+                    body = f"Blocked by sandbox security policy: {pe}\n"
+                    body_bytes = body.encode("utf-8")
+                    resp = (
+                        f"HTTP/1.1 403 Forbidden\r\n"
+                        f"Content-Type: text/plain; charset=utf-8\r\n"
+                        f"Content-Length: {len(body_bytes)}\r\n"
+                        f"X-Blocked-By: sandbox-filter\r\n"
+                        f"X-Blocked-Reason: SSRF-DNS-Rebinding\r\n"
+                        f"Connection: close\r\n\r\n"
+                    )
+                    client_w.write(resp.encode("utf-8") + body_bytes)
+                    await client_w.drain()
+                    client_w.close()
+                    return
                 except Exception as e:
                     body = f"Failed to connect to {host}:{port}: {e}\n"
                     body_bytes = body.encode("utf-8")
@@ -310,6 +388,9 @@ class FilteringProxyServer:
 
 
 async def run_proxy(sock_path, whitelist_path):
+    setup_parent_death_signal()
+    parent_pid = os.getppid()
+
     if os.path.exists(sock_path):
         os.unlink(sock_path)
 
@@ -325,11 +406,21 @@ async def run_proxy(sock_path, whitelist_path):
         except NotImplementedError:
             pass
 
+    async def parent_watchdog():
+        while not stop_event.is_set():
+            await asyncio.sleep(1.0)
+            if os.getppid() != parent_pid:
+                stop_event.set()
+                break
+
+    watchdog_task = asyncio.create_task(parent_watchdog())
+
     try:
         await stop_event.wait()
     except asyncio.CancelledError:
         pass
     finally:
+        watchdog_task.cancel()
         server.close()
         await server.wait_closed()
         if os.path.exists(sock_path):
@@ -337,6 +428,9 @@ async def run_proxy(sock_path, whitelist_path):
 
 
 async def run_relay(tcp_port, sock_path):
+    setup_parent_death_signal()
+    parent_pid = os.getppid()
+
     async def handle_tcp(client_r, client_w):
         try:
             unix_r, unix_w = await asyncio.open_unix_connection(sock_path)
@@ -358,11 +452,21 @@ async def run_relay(tcp_port, sock_path):
         except NotImplementedError:
             pass
 
+    async def parent_watchdog():
+        while not stop_event.is_set():
+            await asyncio.sleep(1.0)
+            if os.getppid() != parent_pid:
+                stop_event.set()
+                break
+
+    watchdog_task = asyncio.create_task(parent_watchdog())
+
     try:
         await stop_event.wait()
     except asyncio.CancelledError:
         pass
     finally:
+        watchdog_task.cancel()
         server.close()
         await server.wait_closed()
 
