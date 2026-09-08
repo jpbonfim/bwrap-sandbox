@@ -547,7 +547,7 @@ for sysdir in /bin /sbin /lib /lib64; do
     fi
 done
 
-# Ephemeral sandbox runtime files (clean /etc/hosts with IPv4 & IPv6 loopback)
+# Ephemeral sandbox runtime files (clean /etc/hosts with IPv4 & IPv6 loopback, plus synthetic /etc/passwd and /etc/group)
 SANDBOX_RUNTIME_DIR="$(mktemp -d /tmp/bwrap-rt-XXXXXX)"
 chmod 0755 "$SANDBOX_RUNTIME_DIR"
 
@@ -556,13 +556,35 @@ cat <<EOF > "$SANDBOX_RUNTIME_DIR/hosts"
 127.0.0.1 localhost $HOST_NAME
 ::1 localhost ip6-localhost ip6-loopback
 EOF
-chmod 0644 "$SANDBOX_RUNTIME_DIR/hosts"
+
+# Synthetic POSIX identity to satisfy Node.js (os.userInfo()), Python (pwd.getpwuid()), git committer detection, and whoami
+USER_NAME="${USER:-sandbox}"
+USER_UID="$(id -u 2>/dev/null || echo "1000")"
+USER_GID="$(id -g 2>/dev/null || echo "1000")"
+
+cat <<EOF > "$SANDBOX_RUNTIME_DIR/passwd"
+root:x:0:0:root:/root:/bin/bash
+${USER_NAME}:x:${USER_UID}:${USER_GID}:${USER_NAME}:${HOME}:/bin/bash
+EOF
+
+cat <<EOF > "$SANDBOX_RUNTIME_DIR/group"
+root:x:0:
+${USER_NAME}:x:${USER_GID}:
+EOF
+
+chmod 0644 "$SANDBOX_RUNTIME_DIR/hosts" "$SANDBOX_RUNTIME_DIR/passwd" "$SANDBOX_RUNTIME_DIR/group"
 
 # Essential system configuration (read-only)
 BWRAP_ARGS+=(
     "--ro-bind" "$SANDBOX_RUNTIME_DIR/hosts" "/etc/hosts"
+    "--ro-bind" "$SANDBOX_RUNTIME_DIR/passwd" "/etc/passwd"
+    "--ro-bind" "$SANDBOX_RUNTIME_DIR/group" "/etc/group"
     "--ro-bind-try" "/etc/nsswitch.conf" "/etc/nsswitch.conf"
     "--ro-bind-try" "/etc/alternatives" "/etc/alternatives"
+    "--ro-bind-try" "/etc/ld.so.cache" "/etc/ld.so.cache"
+    "--ro-bind-try" "/etc/ld.so.conf" "/etc/ld.so.conf"
+    "--ro-bind-try" "/etc/ld.so.conf.d" "/etc/ld.so.conf.d"
+    "--ro-bind-try" "/etc/localtime" "/etc/localtime"
     "--ro-bind-try" "/etc/ssl" "/etc/ssl"
     "--ro-bind-try" "/etc/pki" "/etc/pki"
     "--ro-bind-try" "/etc/ca-certificates" "/etc/ca-certificates"
