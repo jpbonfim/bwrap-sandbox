@@ -1,0 +1,47 @@
+# ==============================================================================
+# Git Ignore Configuration for configs-agents
+# ==============================================================================
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Temporary, sockets, logs & runtime files
+*.sock
+*.pid
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Local custom whitelists and overrides (keep default allowed-domains.txt)
+*.local.txt
+custom-domains.txt
+my-domains.txt
+allowed-domains.txt.bak
+
+# Local environment & secret variables
+.env
+.env.*
+!.env.example
+
+# IDE & Editor metadata
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Operating System files
+.DS_Store
+Thumbs.db
