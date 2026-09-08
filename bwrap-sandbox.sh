@@ -22,6 +22,46 @@ while [ -h "$SOURCE" ]; do
     [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+# ------------------------------------------------------------------------------
+# Process Display Name (argv[0]) & Early Execution Setup
+# ------------------------------------------------------------------------------
+# Determine the target command name from arguments
+TARGET_CMD_NAME=""
+found_sep=false
+is_info_call=false
+
+for arg in "$@"; do
+    if [ "$arg" = "--" ]; then
+        found_sep=true
+        continue
+    fi
+    if [ "$found_sep" = true ]; then
+        if [ -z "$TARGET_CMD_NAME" ]; then
+            TARGET_CMD_NAME="$(basename "$arg")"
+        fi
+        continue
+    fi
+    case "$arg" in
+        -h|--help|--list-profiles|--init)
+            is_info_call=true
+            ;;
+    esac
+done
+
+if [ "$is_info_call" = false ]; then
+    if [ -z "$TARGET_CMD_NAME" ]; then
+        TARGET_CMD_NAME="$(basename "${SHELL:-bash}")"
+    fi
+
+    # Update process display name (argv[0]) via native Bash exec -a
+    if [ -z "${_BWRAP_REEXEC:-}" ] && [ "$TARGET_CMD_NAME" != "bash" ]; then
+        export _BWRAP_REEXEC=1
+        exec -a "$TARGET_CMD_NAME" "${BASH:-/bin/bash}" "$SOURCE" "$@"
+    fi
+fi
+unset _BWRAP_REEXEC
+
 DEFAULT_PROFILES_FILE="$SCRIPT_DIR/profiles.conf"
 PROFILES_EXAMPLE="$SCRIPT_DIR/profiles.example.conf"
 PROFILES_FILE="$DEFAULT_PROFILES_FILE"
@@ -46,10 +86,21 @@ NET_PROXY_PID=""
 NET_PROXY_DIR=""
 SANDBOX_RUNTIME_DIR=""
 BWRAP_PID=""
+TITLE_RESTORE_NEEDED=false
 
 cleanup() {
     local sig="${1:-0}"
     trap - EXIT INT TERM HUP
+
+    if [ "$TITLE_RESTORE_NEEDED" = true ] && { [ -t 1 ] || [ -t 2 ]; }; then
+        # Restore terminal window title from stack
+        printf '\033[23;0t' 2>/dev/null || true
+        if [ -n "${TMUX:-}" ]; then
+            # Re-enable tmux automatic window renaming
+            printf '\033k\033\\' 2>/dev/null || true
+        fi
+        TITLE_RESTORE_NEEDED=false
+    fi
 
     if [ -n "$BWRAP_PID" ]; then
         kill "$BWRAP_PID" 2>/dev/null || true
@@ -851,6 +902,19 @@ if [ "$ALLOW_NET_FILTERED" = true ]; then
     FINAL_CMD=("/bin/bash" "-c" "$INNER_WRAPPER" "--" "${COMMAND[@]}")
 else
     FINAL_CMD=("${COMMAND[@]}")
+fi
+
+# ------------------------------------------------------------------------------
+# Terminal Window Title & Process Execution
+# ------------------------------------------------------------------------------
+if [ -t 1 ] || [ -t 2 ]; then
+    DISPLAY_TITLE="$(basename "${COMMAND[0]}")"
+    # Push current title onto stack & set title via OSC 0
+    printf '\033[22;0t\033]0;%s\007' "$DISPLAY_TITLE" 2>/dev/null || true
+    if [ -n "${TMUX:-}" ]; then
+        printf '\033k%s\033\\' "$DISPLAY_TITLE" 2>/dev/null || true
+    fi
+    TITLE_RESTORE_NEEDED=true
 fi
 
 EXIT_CODE=0
