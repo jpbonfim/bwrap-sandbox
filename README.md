@@ -280,3 +280,10 @@ Contributions, feedback, and security reviews are warmly welcome!
 >
 > If you notice potential sandbox escapes, permission bypasses, edge cases on your Linux distribution, or have suggestions for tighter default profiles and domain whitelists, please open an issue or submit a pull request! All ideas and improvements are appreciated.
 
+---
+
+## License
+
+This project is licensed under the terms of the [GNU General Public License v3.0 (GPLv3)](LICENSE).
+
+
