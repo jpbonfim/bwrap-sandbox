@@ -59,11 +59,12 @@ chmod +x bwrap-sandbox.sh
 ```
 *(Alternatively, simply running `./bwrap-sandbox.sh` for the first time will automatically instantiate your configuration files).*
 
-3. *(Optional)* Move it to your local path for global access:
+3. *(Optional)* Create a symlink in your user path for global access:
 ```bash
 mkdir -p ~/.local/bin
-cp bwrap-sandbox.sh ~/.local/bin/bwrap-sandbox
+ln -sf "$(pwd)/bwrap-sandbox.sh" ~/.local/bin/bwrap-sandbox
 ```
+*(The script automatically resolves its canonical directory following symlinks, ensuring it seamlessly locates `profiles.conf`, `allowed-domains.txt`, and `net-proxy.py` from anywhere on your system).*
 
 ---
 

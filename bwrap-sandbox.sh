@@ -14,7 +14,14 @@ TARGET_DIR="$(pwd)"
 SELECTED_PROFILES=()
 COMMAND=()
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Resolve canonical directory of the script (following symlinks)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 DEFAULT_PROFILES_FILE="$SCRIPT_DIR/profiles.conf"
 PROFILES_EXAMPLE="$SCRIPT_DIR/profiles.example.conf"
 PROFILES_FILE="$DEFAULT_PROFILES_FILE"
