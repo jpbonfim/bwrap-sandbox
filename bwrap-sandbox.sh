@@ -487,6 +487,7 @@ fi
 BWRAP_ARGS=(
     # 1. Process & Kernel Isolation
     "--unshare-all"     # Unshare user, pid, ipc, uts, cgroup namespaces
+    "--unshare-user"    # Required by bwrap CLI when --disable-userns is passed
     "--disable-userns"  # Prevent child processes from creating nested user namespaces (Mitigates kernel userns LPE exploits)
     "--die-with-parent" # Kill all sandbox processes if parent process exits
     "--new-session"     # Disconnect controlling tty (Mitigates TIOCSTI terminal injection)
