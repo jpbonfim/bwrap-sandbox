@@ -25,7 +25,10 @@ ENV/
 *.swo
 *~
 
-# Local custom whitelists and overrides (keep default allowed-domains.txt)
+# Local active configuration and whitelist (versioned defaults are in *.example.*)
+profiles.conf
+allowed-domains.txt
+*.local.conf
 *.local.txt
 custom-domains.txt
 my-domains.txt

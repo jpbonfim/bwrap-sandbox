@@ -14,10 +14,18 @@ TARGET_DIR="$(pwd)"
 SELECTED_PROFILES=()
 COMMAND=()
 
-AVAILABLE_PROFILES=("dev-tools" "antigravity" "claude" "none")
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+DEFAULT_PROFILES_FILE="$SCRIPT_DIR/profiles.conf"
+PROFILES_EXAMPLE="$SCRIPT_DIR/profiles.example.conf"
+PROFILES_FILE="$DEFAULT_PROFILES_FILE"
+
 DEFAULT_WHITELIST="$SCRIPT_DIR/allowed-domains.txt"
+WHITELIST_EXAMPLE="$SCRIPT_DIR/allowed-domains.example.txt"
+
+# Data structures for profile discovery & configuration
+AVAILABLE_PROFILES=()
+declare -A PROFILE_DESCRIPTIONS=()
+SELECTED_ENV_PATTERNS=()
 
 # Data structures for profile mounts & permissions
 declare -A MOUNT_PERMS=()       # Path -> "ro" | "rw" (Last profile wins)
@@ -95,9 +103,134 @@ set_mount() {
 }
 
 # ------------------------------------------------------------------------------
-# Profile Definitions
+# Path Expansion Helper
 # ------------------------------------------------------------------------------
-apply_profile() {
+expand_path() {
+    local p="$1"
+    if [[ "$p" == "~" ]]; then
+        p="$HOME"
+    elif [[ "$p" == "~/"* ]]; then
+        p="$HOME/${p#\~/}"
+    elif [[ "$p" == "\$HOME"* ]]; then
+        p="$HOME${p#\$HOME}"
+    fi
+    printf "%s\n" "$p"
+}
+
+# ------------------------------------------------------------------------------
+# Configuration Initialization & Profile Discovery (100% Native Bash)
+# ------------------------------------------------------------------------------
+ensure_configs() {
+    local explicit_init="${1:-false}"
+    local created_any=false
+
+    if [ ! -f "$DEFAULT_PROFILES_FILE" ] && [ -f "$PROFILES_EXAMPLE" ]; then
+        cp "$PROFILES_EXAMPLE" "$DEFAULT_PROFILES_FILE"
+        echo "[+] Initialized configuration: $DEFAULT_PROFILES_FILE"
+        created_any=true
+    fi
+
+    if [ ! -f "$DEFAULT_WHITELIST" ] && [ -f "$WHITELIST_EXAMPLE" ]; then
+        cp "$WHITELIST_EXAMPLE" "$DEFAULT_WHITELIST"
+        echo "[+] Initialized whitelist: $DEFAULT_WHITELIST"
+        created_any=true
+    fi
+
+    if [ "$explicit_init" = true ]; then
+        if [ "$created_any" = false ]; then
+            echo "[i] Configuration files already exist:"
+            echo "    Profiles:  $DEFAULT_PROFILES_FILE"
+            echo "    Whitelist: $DEFAULT_WHITELIST"
+        else
+            echo "[✔] Initialization complete."
+            echo "    You can now customize your profiles in '$DEFAULT_PROFILES_FILE'"
+            echo "    and your domain whitelist in '$DEFAULT_WHITELIST'."
+        fi
+    fi
+}
+
+load_available_profiles() {
+    local file="$1"
+    AVAILABLE_PROFILES=()
+    PROFILE_DESCRIPTIONS=()
+
+    if [ ! -f "$file" ]; then
+        AVAILABLE_PROFILES=("dev-tools" "antigravity" "claude" "openai" "deepseek" "mistral" "groq" "none")
+        PROFILE_DESCRIPTIONS["dev-tools"]="Mounts host user toolchains (~/.cargo/bin, ~/.nvm, ~/.pyenv, etc.) [Read-Only]"
+        PROFILE_DESCRIPTIONS["antigravity"]="Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache [RO], and filters D-Bus Keyring"
+        PROFILE_DESCRIPTIONS["claude"]="Mounts ~/.claude, ~/.claude.json, and ~/.config/claude [Read-Write]"
+        PROFILE_DESCRIPTIONS["openai"]="Forwards OpenAI API credentials"
+        PROFILE_DESCRIPTIONS["deepseek"]="Forwards DeepSeek API credentials"
+        PROFILE_DESCRIPTIONS["mistral"]="Forwards Mistral API credentials"
+        PROFILE_DESCRIPTIONS["groq"]="Forwards Groq API credentials"
+        PROFILE_DESCRIPTIONS["none"]="No extra mounts or environment variables applied (default)"
+        return 0
+    fi
+
+    local current_sec=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" =~ ^# || "$line" =~ ^\; ]] && continue
+
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_.-]+)\]$ ]]; then
+            current_sec="${BASH_REMATCH[1]}"
+            AVAILABLE_PROFILES+=("$current_sec")
+            PROFILE_DESCRIPTIONS["$current_sec"]=""
+        elif [ -n "$current_sec" ]; then
+            if [[ "$line" =~ ^description[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+                PROFILE_DESCRIPTIONS["$current_sec"]="${BASH_REMATCH[1]}"
+            fi
+        fi
+    done < "$file"
+}
+
+# ------------------------------------------------------------------------------
+# Profile Application (Config-Driven with Fallback)
+# ------------------------------------------------------------------------------
+apply_profile_from_config() {
+    local profile="$1"
+    local file="$2"
+    local in_section=false
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" =~ ^# || "$line" =~ ^\; ]] && continue
+
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_.-]+)\]$ ]]; then
+            if [ "${BASH_REMATCH[1]}" = "$profile" ]; then
+                in_section=true
+            else
+                if [ "$in_section" = true ]; then
+                    break
+                fi
+            fi
+            continue
+        fi
+
+        if [ "$in_section" = true ]; then
+            if [[ "$line" =~ ^mount[[:space:]]*=[[:space:]]*([a-zA-Z]+):(.*)$ ]]; then
+                local mode="${BASH_REMATCH[1]}"
+                local raw_path="${BASH_REMATCH[2]}"
+                raw_path="${raw_path#"${raw_path%%[![:space:]]*}"}"
+                raw_path="${raw_path%"${raw_path##*[![:space:]]}"}"
+                local exp_path
+                exp_path="$(expand_path "$raw_path")"
+                set_mount "$mode" "$exp_path"
+            elif [[ "$line" =~ ^env[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+                local env_pat="${BASH_REMATCH[1]}"
+                env_pat="${env_pat#"${env_pat%%[![:space:]]*}"}"
+                env_pat="${env_pat%"${env_pat##*[![:space:]]}"}"
+                SELECTED_ENV_PATTERNS+=("$env_pat")
+            elif [[ "$line" =~ ^filtered_dbus[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
+                ENABLE_FILTERED_DBUS=true
+            fi
+        fi
+    done < "$file"
+}
+
+apply_profile_fallback() {
     local profile="$1"
     case "$profile" in
         dev-tools)
@@ -112,47 +245,77 @@ apply_profile() {
             set_mount "ro" "$HOME/.bun/bin"
             set_mount "ro" "$HOME/go/bin"
             ;;
-
         antigravity)
             set_mount "rw" "$HOME/.antigravity"
             set_mount "rw" "$HOME/.gemini"
             set_mount "ro" "$HOME/.cache/ms-playwright-go"
             set_mount "ro" "$HOME/.cache/ms-playwright"
+            SELECTED_ENV_PATTERNS+=("GEMINI_API_KEY" "ANTIGRAVITY_*")
             ENABLE_FILTERED_DBUS=true
             ;;
-
         claude)
             set_mount "rw" "$HOME/.claude"
             set_mount "rw" "$HOME/.claude.json"
             set_mount "rw" "$HOME/.config/claude"
             set_mount "rw" "$HOME/.local/share/claude"
             set_mount "rw" "$HOME/.local/state/claude"
+            SELECTED_ENV_PATTERNS+=("ANTHROPIC_API_KEY")
             ;;
-
+        openai)
+            SELECTED_ENV_PATTERNS+=("OPENAI_API_KEY")
+            ;;
+        deepseek)
+            SELECTED_ENV_PATTERNS+=("DEEPSEEK_API_KEY")
+            ;;
+        mistral)
+            SELECTED_ENV_PATTERNS+=("MISTRAL_API_KEY")
+            ;;
+        groq)
+            SELECTED_ENV_PATTERNS+=("GROQ_API_KEY")
+            ;;
         none)
             ;;
-
-        *)
-            echo "Error: Unknown profile '$profile'." >&2
-            echo "Available profiles: ${AVAILABLE_PROFILES[*]}" >&2
-            exit 1
-            ;;
     esac
+}
+
+apply_profile() {
+    local profile="$1"
+    local found=false
+    for p in "${AVAILABLE_PROFILES[@]}"; do
+        if [ "$p" = "$profile" ]; then
+            found=true
+            break
+        fi
+    done
+
+    if [ "$found" = false ]; then
+        echo "Error: Unknown profile '$profile'." >&2
+        echo "Available profiles: ${AVAILABLE_PROFILES[*]}" >&2
+        exit 1
+    fi
+
+    if [ -f "$PROFILES_FILE" ]; then
+        apply_profile_from_config "$profile" "$PROFILES_FILE"
+    else
+        apply_profile_fallback "$profile"
+    fi
 }
 
 # ------------------------------------------------------------------------------
 # Help & Usage
 # ------------------------------------------------------------------------------
 list_profiles() {
+    echo "Available Agent Profiles (from $(basename "$PROFILES_FILE")):"
+    for p in "${AVAILABLE_PROFILES[@]}"; do
+        local desc="${PROFILE_DESCRIPTIONS["$p"]:-No description provided}"
+        printf "  %-14s %s\n" "$p" "$desc"
+    done
     cat <<EOF
-Available Agent Profiles:
-  dev-tools      Mounts host user toolchains (~/.cargo/bin, ~/.nvm, ~/.pyenv, etc.) [Read-Only]
-  antigravity    Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache [RO], and filters D-Bus Keyring
-  claude         Mounts ~/.claude, ~/.claude.json, and ~/.config/claude [Read-Write]
-  none           No extra mounts applied (default)
 
 Note: You can pass multiple profiles (e.g. -p dev-tools -p antigravity).
       If path permissions conflict, the last profile specified takes precedence.
+      Profiles and forwarded environment variables are configured in:
+      $PROFILES_FILE
 EOF
 }
 
@@ -165,6 +328,8 @@ A security-hardened Bubblewrap sandbox for AI coding agents.
 Options:
   -p, --profile NAME       Permission profile (Can be repeated or comma-separated)
       --list-profiles      List available permission profiles and descriptions
+  -c, --config PATH        Path to profiles configuration file (Default: profiles.conf)
+      --init               Initialize profiles.conf and allowed-domains.txt from templates and exit
   -n, --net                Allow unrestricted network access (Default: OFF / isolated)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
@@ -172,6 +337,7 @@ Options:
   -h, --help               Show this help message
 
 Examples:
+  $(basename "$0") --init
   $(basename "$0") --list-profiles
   $(basename "$0") -p dev-tools,antigravity -nf -- agy
   $(basename "$0") -p dev-tools,claude -nf -- claude
@@ -180,6 +346,42 @@ Examples:
 EOF
     exit 0
 }
+
+# ------------------------------------------------------------------------------
+# Early Option Handling & Profile Config Loading
+# ------------------------------------------------------------------------------
+# Handle --init early before full option parsing
+for arg in "$@"; do
+    if [ "$arg" = "--init" ]; then
+        ensure_configs true
+        exit 0
+    fi
+done
+
+# Pre-scan arguments for custom config file
+for ((i=1; i<=$#; i++)); do
+    case "${!i}" in
+        -c|--config)
+            next_idx=$((i + 1))
+            if [ $next_idx -le $# ]; then
+                PROFILES_FILE="${!next_idx}"
+            fi
+            ;;
+    esac
+done
+
+# If using default profiles file, auto-create if missing
+if [ "$PROFILES_FILE" = "$DEFAULT_PROFILES_FILE" ]; then
+    ensure_configs false
+fi
+
+if [ "$PROFILES_FILE" != "$DEFAULT_PROFILES_FILE" ] && [ ! -f "$PROFILES_FILE" ]; then
+    echo "Error: Profiles configuration file not found: '$PROFILES_FILE'" >&2
+    exit 1
+fi
+
+# Load available profiles and their descriptions
+load_available_profiles "$PROFILES_FILE"
 
 # ------------------------------------------------------------------------------
 # Parse Arguments
@@ -195,6 +397,14 @@ while [[ $# -gt 0 ]]; do
         ;;
     --list-profiles)
         list_profiles
+        exit 0
+        ;;
+    -c | --config)
+        PROFILES_FILE="$2"
+        shift 2
+        ;;
+    --init)
+        ensure_configs true
         exit 0
         ;;
     -n | --net)
@@ -494,27 +704,34 @@ if [ "$ALLOW_NET_FILTERED" = true ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# AI Keys Forwarding (Appended AFTER --clearenv)
+# Per-Profile Environment Variable Forwarding (Appended AFTER --clearenv)
 # ------------------------------------------------------------------------------
-if [ "$ALLOW_NET" = true ] || [ "$ALLOW_NET_FILTERED" = true ]; then
-    AI_KEYS=(
-        "ANTHROPIC_API_KEY"
-        "OPENAI_API_KEY"
-        "GEMINI_API_KEY"
-        "DEEPSEEK_API_KEY"
-        "MISTRAL_API_KEY"
-        "GROQ_API_KEY"
-    )
-    for key in "${AI_KEYS[@]}"; do
-        if [ -n "${!key:-}" ]; then
-            BWRAP_ENV+=("--setenv" "$key" "${!key}")
+# Only variables explicitly declared via 'env' in selected profiles are forwarded.
+# Wildcards (e.g. ANTIGRAVITY_*) are dynamically expanded against exported variables.
+declare -A FORWARDED_ENV_VARS=()
+
+for pat in "${SELECTED_ENV_PATTERNS[@]}"; do
+    if [[ "$pat" == *"*"* ]]; then
+        prefix="${pat%%\**}"
+        for var in $(compgen -v "$prefix" 2>/dev/null || true); do
+            if [[ "$var" == $pat ]]; then
+                if [ -z "${FORWARDED_ENV_VARS["$var"]:-}" ]; then
+                    if [ -n "${!var:-}" ] && [[ "$(declare -p "$var" 2>/dev/null || true)" =~ ^declare\ -[a-z]*x ]]; then
+                        FORWARDED_ENV_VARS["$var"]=1
+                        BWRAP_ENV+=("--setenv" "$var" "${!var}")
+                    fi
+                fi
+            fi
+        done
+    else
+        if [ -z "${FORWARDED_ENV_VARS["$pat"]:-}" ]; then
+            if [ -n "${!pat:-}" ] && [[ "$(declare -p "$pat" 2>/dev/null || true)" =~ ^declare\ -[a-z]*x ]]; then
+                FORWARDED_ENV_VARS["$pat"]=1
+                BWRAP_ENV+=("--setenv" "$pat" "${!pat}")
+            fi
         fi
-    done
-    # Forward any Antigravity-specific environment variables
-    for var in $(env | grep -E '^ANTIGRAVITY_' | cut -d= -f1); do
-        BWRAP_ENV+=("--setenv" "$var" "${!var}")
-    done
-fi
+    fi
+done
 
 # ------------------------------------------------------------------------------
 # Execution

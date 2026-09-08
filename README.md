@@ -21,7 +21,10 @@ A security-hardened, zero-daemon sandbox built on [Bubblewrap (`bwrap`)](https:/
 
 ## Prerequisites
 
-Bubblewrap, Python 3, and the D-Bus filtering proxy must be installed on the Linux host. `socat` is optional but **recommended** for near-zero memory footprint (~1.5 MB) during filtered network proxying:
+* **Bubblewrap (`bwrap`)**: Required for kernel namespace isolation (`sudo apt install bubblewrap`).
+* **Python 3**: Only required if using domain-filtered network access (`-nf, --net-filtered`) to run `net-proxy.py`. All profile parsing, mounts, and sandbox controls are **100% native Bash**.
+* **xdg-dbus-proxy**: Required only for profiles using filtered GNOME Keyring / Secret Service (`sudo apt install xdg-dbus-proxy`).
+* **socat**: *(Optional, recommended)* Accelerates internal network loopback relay with minimal RAM overhead (~1.5 MB).
 
 ```bash
 # Debian / Ubuntu
@@ -32,35 +35,72 @@ sudo dnf install bubblewrap xdg-dbus-proxy socat python3
 
 # Arch Linux
 sudo pacman -S bubblewrap xdg-dbus-proxy socat python
-
 ```
 
 > **Ubuntu 24.04 LTS Notice:** If you encounter `bwrap: No permissions to creating new namespace`, enable unprivileged user namespaces via sysctl:
 > ```bash
 > sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-> 
 > ```
-> 
-> 
 
 ---
 
-## Installation
+## Installation & Initialization
 
-1. Save the script as `bwrap-sandbox.sh`.
-2. Make it executable:
-
+1. Clone or download the repository:
 ```bash
+git clone https://github.com/jpbonfim/configs-agents.git
+cd configs-agents
 chmod +x bwrap-sandbox.sh
-
 ```
 
-3. *(Optional)* Move it to your local path for global access:
+2. Initialize your local configuration:
+```bash
+./bwrap-sandbox.sh --init
+```
+*(Alternatively, simply running `./bwrap-sandbox.sh` for the first time will automatically instantiate your configuration files).*
 
+3. *(Optional)* Move it to your local path for global access:
 ```bash
 mkdir -p ~/.local/bin
 cp bwrap-sandbox.sh ~/.local/bin/bwrap-sandbox
+```
 
+---
+
+## Configuration
+
+All profiles, permissions, and network domain rules are declarative and stored in local configuration files that are ignored by Git (`.gitignore`). This allows you to customize paths, API credentials, and whitelist domains locally without causing merge conflicts when pulling upstream updates.
+
+| File | Status | Description |
+| --- | --- | --- |
+| `profiles.example.conf` | Versioned in Git | Template defining default profiles and permissions. |
+| `profiles.conf` | Ignored by Git | Your active, locally editable profile configuration. |
+| `allowed-domains.example.txt` | Versioned in Git | Template listing standard agent endpoints (Google, Anthropic, NPM, etc.). |
+| `allowed-domains.txt` | Ignored by Git | Your active domain whitelist used by `-nf`. |
+
+### Configuring Profiles (`profiles.conf`)
+
+Profiles use standard INI syntax. Any section `[profile-name]` automatically becomes an available profile selectable via `-p profile-name`.
+
+Supported directives:
+* `description = <text>`: Summary shown in `--list-profiles`.
+* `mount = <ro|rw>:<path>`: Directory or file to bind-mount. Supports `~` and `$HOME` expansion. Repeatable.
+* `env = <NAME|PATTERN_*>`: Environment variable(s) to forward from the host. Supports wildcards (e.g., `ANTIGRAVITY_*`). Repeatable.
+* `filtered_dbus = true|false`: Enables the secure filtered D-Bus proxy for Keyring/Secret Service tokens.
+
+**Example custom profile:**
+```ini
+[my-agent]
+description = Custom agent workspace and Hugging Face credentials
+mount = rw:~/.cache/huggingface
+mount = ro:~/.config/my-agent
+env = HF_TOKEN
+env = MY_AGENT_*
+```
+
+Once saved, `my-agent` will instantly appear in `--list-profiles` and can be invoked with:
+```bash
+./bwrap-sandbox.sh -p dev-tools,my-agent -nf -- my-agent-cli
 ```
 
 ---
@@ -75,12 +115,13 @@ A security-hardened Bubblewrap sandbox for AI coding agents.
 Options:
   -p, --profile NAME       Permission profile (Can be repeated or comma-separated)
       --list-profiles      List available permission profiles and descriptions
+  -c, --config PATH        Path to profiles configuration file (Default: profiles.conf)
+      --init               Initialize profiles.conf and allowed-domains.txt from templates and exit
   -n, --net                Allow unrestricted network access (Default: OFF / isolated)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
   -h, --help               Show this help message
-
 ```
 
 The `--` delimiter separates script options from the command passed to the sandbox.
@@ -136,32 +177,33 @@ When downloading from unwhitelisted package repositories or running unrestricted
 
 ---
 
-## Profiles
+## Profiles & Environment Isolation
 
-Profiles govern which host paths and IPC mechanisms are exposed. Multiple profiles can be combined; in case of path permission conflicts, the last profile evaluated wins.
+Profiles govern which host paths, IPC mechanisms, and environment variables are exposed to the sandbox. Multiple profiles can be combined; in case of path permission conflicts, the last profile evaluated wins.
 
-| Profile | Mounts / Permissions | Purpose |
-| --- | --- | --- |
-| `dev-tools` | `~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `~/.rustup`, `~/.fnm`, `~/.volta`, `~/.bun/bin`, `~/go/bin` **[RO]** | Exposes host toolchains to compile and test without risking modifications. |
-| `antigravity` | `~/.antigravity` **[RW]**<br>
+| Profile | Mounts / Permissions | Forwarded Environment Variables | Purpose |
+| --- | --- | --- | --- |
+| `dev-tools` | `~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `~/.rustup`, `~/.fnm`, `~/.volta`, `~/.bun/bin`, `~/go/bin` **[RO]** | *(None)* | Exposes host toolchains to compile and test without modifying binaries. |
+| `antigravity` | `~/.antigravity` **[RW]**<br>`~/.gemini` **[RW]**<br>`~/.cache/ms-playwright-go` **[RO]**<br>`xdg-dbus-proxy` socket | `GEMINI_API_KEY`<br>`ANTIGRAVITY_*` | Preserves Antigravity/Gemini state and uses filtered D-Bus for Google OAuth / GNOME Keyring. |
+| `claude` | `~/.claude` **[RW]**<br>`~/.claude.json` **[RW]**<br>`~/.config/claude` **[RW]**<br>`~/.local/share/claude` **[RW]**<br>`~/.local/state/claude` **[RW]** | `ANTHROPIC_API_KEY` | Preserves Claude Code authentication and workspace session history. |
+| `openai` | *(None)* | `OPENAI_API_KEY` | Forwards OpenAI API credentials to tools that require them. |
+| `deepseek` | *(None)* | `DEEPSEEK_API_KEY` | Forwards DeepSeek API credentials. |
+| `mistral` | *(None)* | `MISTRAL_API_KEY` | Forwards Mistral API credentials. |
+| `groq` | *(None)* | `GROQ_API_KEY` | Forwards Groq API credentials. |
+| `none` | *(None)* | *(None)* | Pure isolation; no host configs, credentials, or toolchains escape RAM. |
 
-<br>`~/.gemini` **[RW]**<br>
+### Per-Profile Environment Variable Isolation
 
-<br>`~/.cache/ms-playwright-go` **[RO]**<br>
+To prevent credential leakage and uphold the principle of least privilege, environment variables are passed into the sandbox **only** if they are explicitly matched by an `env` directive in one of the active profiles:
 
-<br>`xdg-dbus-proxy` socket | Preserves Antigravity/Gemini state and uses filtered D-Bus for Google OAuth / GNOME Keyring access. |
-| `claude` | `~/.claude` **[RW]**<br>
+* Running `./bwrap-sandbox.sh -p dev-tools -- cargo build` passes **zero** API keys into the sandbox.
+* Running `./bwrap-sandbox.sh -p claude -- claude` passes only `ANTHROPIC_API_KEY`, keeping your other credentials hidden.
+* Running `./bwrap-sandbox.sh -p claude,openai -- my-script` passes both `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
+* Profiles support wildcards (`env = ANTIGRAVITY_*`), forwarding all matching exported host variables.
 
-<br>`~/.claude.json` **[RW]**<br>
-
-<br>`~/.config/claude` **[RW]** | Preserves Claude Code authentication and workspace session history. |
-| `none` | *(None)* | Pure isolation; no host configs or toolchains escape RAM. |
-
-List profiles and descriptions:
-
+Inspect current profiles and descriptions:
 ```bash
 ./bwrap-sandbox.sh --list-profiles
-
 ```
 
 ---
@@ -173,7 +215,7 @@ List profiles and descriptions:
 | HOST SYSTEM                                                             |
 |  ~/.ssh, ~/.aws, /etc/shadow             (Completely Hidden)            |
 |  /usr, /bin, ~/.cargo/bin                (Mounted Read-Only)            |
-|  /run/user/$UID/bus                      (Protected by xdg-dbus-proxy)   |
+|  /run/user/$UID/bus                      (Protected by xdg-dbus-proxy)  |
 |  /tmp/bwrap-net-XXXXXX/proxy.sock        (Unix Socket Domain Filter)    |
 +-------------------------------------------------------------------------+
        |                                             |
@@ -187,21 +229,21 @@ List profiles and descriptions:
 |  BLOCK: Everything else            |                   |
 +------------------------------------+                   | (Bind-Mount)
                    |                                     v
-                   |          +-------------------------------------------+
-                   +=========>| BWRAP SANDBOX (--unshare-net)             |
-                              |  [Filesystem]                             |
-                              |   ├── /         (Read-Only)               |
-                              |   ├── /tmp      (Ephemeral RAM tmpfs)     |
-                              |   ├── $HOME     (RAM tmpfs)               |
-                              |   └── /workspace(Mounted Read-Write)      |
-                              |         └── .git/hooks (Read-Only)        |
-                              |  [Network Relay]                          |
-                              |   └── 127.0.0.1:18080 (socat/python relay)|
-                              |  [Isolation]                              |
-                              |   ├── Kernel Net: Isolated (unshared)     |
-                              |   ├── PID 1     : Private PID namespace   |
-                              |   └── Session   : Detached (No TIOCSTI)   |
-                              +-------------------------------------------+
+                   |          +--------------------------------------------+
+                   +=========>| BWRAP SANDBOX (--unshare-net)              |
+                              |  [Filesystem]                              |
+                              |   ├── /          (Read-Only)               |
+                              |   ├── /tmp       (Ephemeral RAM tmpfs)     |
+                              |   ├── $HOME      (RAM tmpfs)               |
+                              |   └── /workspace (Mounted Read-Write)      |
+                              |         └── .git/hooks (Read-Only)         |
+                              |  [Network Relay]                           |
+                              |   └── 127.0.0.1:18080 (socat/python relay) |
+                              |  [Isolation]                               |
+                              |   ├── Kernel Net: Isolated (unshared)      |
+                              |   ├── PID 1     : Private PID namespace    |
+                              |   └── Session   : Detached (No TIOCSTI)    |
+                              +--------------------------------------------+
 ```
 
 ### Defense Mechanisms in Detail
@@ -213,6 +255,7 @@ List profiles and descriptions:
 * **Git Hook Trap Neutralization:** Agents cannot escalate privileges outside the sandbox by dropping malicious triggers into `.git/hooks/pre-commit`. The sandbox enforces `--ro-bind` on `.git/hooks` and exports `GIT_CONFIG_PARAMETERS='core.hooksPath=/dev/null'`.
 * **Process Termination Assurance (`--die-with-parent`):** If the parent shell or terminal terminates, the Linux kernel terminates every subprocess inside the sandbox namespace.
 * **Automatic Resource Cleanup:** A bash `trap` cleans up the `xdg-dbus-proxy` and `net-proxy.py` background processes and removes temporary directories (`/tmp/bwrap-dbus-*`, `/tmp/bwrap-net-*`) upon exit.
+* **Declarative Per-Profile Secret Scoping:** The sandbox runs `--clearenv` to scrub all host environment variables. Unlike traditional wrappers that unconditionally pass all API keys whenever network is enabled, `bwrap-sandbox` inspects the active profiles defined in `profiles.conf` and injects *only* the specific variables declared for those profiles (supporting exact names and wildcards). Toolchains, build runners, and unselected agents run with zero exposed keys.
 * **Usr-Merge Compatibility:** Automatically identifies and maps relative symlinks for `/bin`, `/sbin`, `/lib`, and `/lib64`, preventing mount failure on modern Debian, Ubuntu, and Arch Linux distributions.
 
 ---
