@@ -574,11 +574,20 @@ BWRAP_ARGS+=(
     "--chdir" "$TARGET_DIR"
 )
 
-# Edge Case: Prevent Git Hook Poisoning (Workspace Escape Vector)
-# If .git exists, make .git/hooks read-only so agent cannot insert malicious triggers
+# Edge Case: Prevent Git Hook & Config Poisoning (Workspace Escape Vectors)
+# If .git exists:
+# 1. Make .git/hooks read-only so agent cannot insert malicious hook triggers
+# 2. Make .git/config read-only so agent cannot inject core.fsmonitor, core.hooksPath,
+#    diff.external, core.pager, or credential.helper to achieve host execution upon exiting.
 if [ -d "$TARGET_DIR/.git" ]; then
     mkdir -p "$TARGET_DIR/.git/hooks"
     BWRAP_ARGS+=("--ro-bind" "$TARGET_DIR/.git/hooks" "$TARGET_DIR/.git/hooks")
+    if [ -f "$TARGET_DIR/.git/config" ]; then
+        BWRAP_ARGS+=("--ro-bind" "$TARGET_DIR/.git/config" "$TARGET_DIR/.git/config")
+    fi
+elif [ -f "$TARGET_DIR/.git" ]; then
+    # Git worktree or submodule pointer file
+    BWRAP_ARGS+=("--ro-bind" "$TARGET_DIR/.git" "$TARGET_DIR/.git")
 fi
 
 # ------------------------------------------------------------------------------
