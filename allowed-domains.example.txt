@@ -3,19 +3,22 @@
 # ==============================================================================
 # Format: One domain pattern per line.
 # Supports shell glob wildcards (*.domain.com).
+# Note: '*.domain.com' automatically matches both 'domain.com' and subdomains.
 # Lines starting with '#' and empty lines are ignored.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
 # 1. Anthropic & Claude Code
 # ------------------------------------------------------------------------------
-api.anthropic.com
+anthropic.com
 *.anthropic.com
 claude.ai
 *.claude.ai
 statsig.anthropic.com
 statsigapi.net
 *.statsigapi.net
+featuregates.org
+*.featuregates.org
 sentry.io
 *.sentry.io
 
@@ -31,69 +34,197 @@ googleapis.com
 www.googleapis.com
 firebase.googleapis.com
 identitytoolkit.googleapis.com
+aistudio.google.com
+alkalimakersuite-pa.clients6.google.com
 lh3.googleusercontent.com
-
+*.googleusercontent.com
 
 # ------------------------------------------------------------------------------
-# 3. OpenAI, DeepSeek, Groq & Mistral (Major LLM APIs)
+# 3. Major LLM APIs & AI Hubs
 # ------------------------------------------------------------------------------
-api.openai.com
+# OpenAI
+openai.com
 *.openai.com
-api.deepseek.com
+api.openai.com
+chatgpt.com
+*.chatgpt.com
+
+# DeepSeek, Groq, Mistral
+deepseek.com
 *.deepseek.com
-api.groq.com
+groq.com
 *.groq.com
-api.mistral.ai
+mistral.ai
 *.mistral.ai
 
+# OpenRouter & Unified AI Providers
+openrouter.ai
+*.openrouter.ai
+together.ai
+*.together.ai
+together.xyz
+*.together.xyz
+cohere.ai
+*.cohere.ai
+cohere.com
+*.cohere.com
+perplexity.ai
+*.perplexity.ai
+fireworks.ai
+*.fireworks.ai
+
+# Hugging Face (Model Hub, Datasets, Tokenizers)
+huggingface.co
+*.huggingface.co
+hf.co
+*.hf.co
+
+# Ollama
+ollama.com
+*.ollama.com
+
 # ------------------------------------------------------------------------------
-# 4. GitHub & GitLab (Source Control, Releases, Assets & Raw Files)
+# 4. Git & Code Hosting
 # ------------------------------------------------------------------------------
 github.com
 *.github.com
-api.github.com
 raw.githubusercontent.com
 objects.githubusercontent.com
 codeload.github.com
 github-releases.githubusercontent.com
 gist.github.com
+*.githubusercontent.com
 gitlab.com
 *.gitlab.com
+bitbucket.org
+*.bitbucket.org
+codeberg.org
+*.codeberg.org
 
 # ------------------------------------------------------------------------------
-# 5. Package Registries & Language Ecosystems
+# 5. Package Registries, Toolchains & Runtimes
 # ------------------------------------------------------------------------------
-# Node.js / NPM / Yarn
-registry.npmjs.org
+# JavaScript / TypeScript (Node.js, NPM, Yarn, Bun, Deno, JSR)
+nodejs.org
+*.nodejs.org
+npmjs.org
 *.npmjs.org
-registry.yarnpkg.com
+registry.npmjs.org
+yarnpkg.com
 *.yarnpkg.com
+bun.sh
+*.bun.sh
+deno.land
+*.deno.land
+deno.com
+*.deno.com
+jsr.io
+*.jsr.io
 
-# Python / PyPI
+# Python / PyPI / Pyenv
 pypi.org
 *.pypi.org
 files.pythonhosted.org
 *.pythonhosted.org
 pypi.python.org
+python.org
+*.python.org
 
-# Rust / Cargo
+# Rust / Cargo / Rustup
 crates.io
 *.crates.io
 static.crates.io
 index.crates.io
+rust-lang.org
+*.rust-lang.org
+static.rust-lang.org
 
-# Go
+# Go / Golang
+golang.org
+*.golang.org
+go.dev
+*.go.dev
 proxy.golang.org
 sum.golang.org
 
-# ------------------------------------------------------------------------------
-# 6. Common CDNs & Headless Browser Runtimes
-# ------------------------------------------------------------------------------
-# Playwright (used by Antigravity and automated test suites)
-playwright.azureedge.net
-*.playwright.dev
+# Java / Kotlin / Scala (Maven & Gradle)
+maven.org
+*.maven.org
+repo.maven.apache.org
+repo1.maven.org
+gradle.org
+*.gradle.org
+plugins.gradle.org
+services.gradle.org
 
-# Popular Web CDNs
+# .NET / C# (NuGet)
+nuget.org
+*.nuget.org
+api.nuget.org
+
+# PHP (Composer / Packagist)
+packagist.org
+*.packagist.org
+getcomposer.org
+*.getcomposer.org
+
+# Ruby (RubyGems / Bundler)
+rubygems.org
+*.rubygems.org
+
+# Container & Artifact Registries
+ghcr.io
+*.ghcr.io
+docker.io
+*.docker.io
+registry-1.docker.io
+production.cloudflare.docker.com
+quay.io
+*.quay.io
+
+# ------------------------------------------------------------------------------
+# 6. Browser Automation & Testing Drivers
+# ------------------------------------------------------------------------------
+# Playwright & Puppeteer (Used by Antigravity, browser automation & test suites)
+playwright.azureedge.net
+playwright.dev
+*.playwright.dev
+edgedl.me.gvt1.com
+msedge.b.tlu.dl.delivery.mp.microsoft.com
+
+# Cypress
+cypress.io
+*.cypress.io
+download.cypress.io
+
+# ------------------------------------------------------------------------------
+# 7. CDNs, Schemas & Web Assets
+# ------------------------------------------------------------------------------
 cdn.jsdelivr.net
+fastly.jsdelivr.net
 unpkg.com
+*.unpkg.com
 cdnjs.cloudflare.com
+esm.sh
+*.esm.sh
+skypack.dev
+*.skypack.dev
+
+# JSON Schemas & Validation (Used by linters, ts-node, IDEs)
+schemastore.org
+*.schemastore.org
+json-schema.org
+*.json-schema.org
+
+# ------------------------------------------------------------------------------
+# 8. Documentation & Security Vulnerability Databases
+# ------------------------------------------------------------------------------
+# Vulnerability Databases (Used by npm audit, cargo audit, pip-audit)
+osv.dev
+*.osv.dev
+
+# Official Documentation
+developer.mozilla.org
+devdocs.io
+docs.rs
+pkg.go.dev
