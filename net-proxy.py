@@ -37,22 +37,21 @@ def setup_parent_death_signal():
         pass
 
 
-async def resolve_safe_connect_host(host):
+async def open_safe_connection(host, port):
     """
-    Resolves the upstream host and prevents DNS Rebinding and SSRF attacks.
-    - If host is a recognized local alias (localhost, 127.0.0.1, ::1), returns '127.0.0.1'.
-    - If host is an external domain, resolves its DNS addresses and blocks connections
-      if any resolved IP falls into loopback, link-local / cloud metadata (169.254.x.x), or unspecified (0.0.0.0).
+    Resolves the upstream host, validates IPs against SSRF/DNS Rebinding,
+    and connects directly to the validated IP to prevent TOCTOU DNS Rebinding attacks.
     """
     if host.lower() in LOCAL_HOSTS:
-        return "127.0.0.1"
+        return await asyncio.open_connection("127.0.0.1", port)
 
     loop = asyncio.get_running_loop()
     try:
-        addr_info = await loop.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+        addr_info = await loop.getaddrinfo(host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
     except socket.gaierror as e:
         raise ConnectionError(f"DNS resolution failed for {host}: {e}")
 
+    safe_ips = []
     for item in addr_info:
         ip_str = item[4][0]
         try:
@@ -65,8 +64,21 @@ async def resolve_safe_connect_host(host):
             raise PermissionError(f"SSRF/DNS Rebinding blocked: '{host}' resolved to link-local/cloud metadata IP ({ip_str})")
         if ip.is_unspecified:
             raise PermissionError(f"SSRF/DNS Rebinding blocked: '{host}' resolved to unspecified IP ({ip_str})")
+        if ip.is_private:
+            raise PermissionError(f"SSRF blocked: '{host}' resolved to private network IP ({ip_str})")
+        safe_ips.append(ip_str)
 
-    return host
+    if not safe_ips:
+        raise ConnectionError(f"No valid IP addresses resolved for {host}")
+
+    last_exc = None
+    for ip_str in safe_ips:
+        try:
+            return await asyncio.open_connection(ip_str, port)
+        except Exception as e:
+            last_exc = e
+
+    raise last_exc or ConnectionError(f"Failed to connect to {host}:{port}")
 
 
 class WhitelistRule:
@@ -75,21 +87,33 @@ class WhitelistRule:
         self.host_pattern, self.allowed_ports = self._parse(self.raw)
 
     def _parse(self, s):
+        # Strip scheme if user mistakenly wrote http:// or https://
+        if s.startswith("https://"):
+            s = s[8:]
+        elif s.startswith("http://"):
+            s = s[7:]
+        # Strip path or trailing slashes
+        s = s.split("/", 1)[0].strip()
+
         # Handle IPv6 brackets like [::1]:port or [::1]
         if s.startswith("["):
             parts = s.rsplit(":", 1)
             host_part = parts[0].strip("[]")
             port_part = parts[1] if len(parts) > 1 and not parts[1].endswith("]") else None
+        elif s.count(":") > 1:
+            # Naked IPv6 address without brackets (e.g. ::1 or 2001:db8::1)
+            host_part = s
+            port_part = None
         elif ":" in s:
             parts = s.split(":", 1)
-            host_part = parts[0]
-            port_part = parts[1]
+            host_part = parts[0].strip()
+            port_part = parts[1].strip()
         else:
-            host_part = s
+            host_part = s.strip()
             port_part = None
 
         ports = self._parse_ports(port_part)
-        return host_part, ports
+        return host_part.strip(), ports
 
     def _parse_ports(self, port_str):
         if port_str is None or not port_str.strip():
@@ -124,8 +148,8 @@ class WhitelistRule:
         return result
 
     def matches(self, target_host, target_port):
-        t_host = target_host.strip("[]").lower()
-        r_host = self.host_pattern.strip("[]").lower()
+        t_host = target_host.strip("[]").rstrip(".").lower()
+        r_host = self.host_pattern.strip("[]").rstrip(".").lower()
 
         matched_host = False
         if r_host in LOCAL_HOSTS and t_host in LOCAL_HOSTS:
@@ -155,15 +179,19 @@ def parse_host_port(target, default_port=80):
                 port = default_port
         else:
             port = default_port
+    elif target.count(":") > 1:
+        # Naked IPv6 without port
+        host = target.strip("[]")
+        port = default_port
     elif ":" in target:
         parts = target.split(":", 1)
-        host = parts[0]
+        host = parts[0].strip()
         try:
             port = int(parts[1])
         except ValueError:
             port = default_port
     else:
-        host = target
+        host = target.strip()
         port = default_port
     return host, port
 
@@ -253,8 +281,7 @@ class FilteringProxyServer:
                     return
 
                 try:
-                    connect_host = await resolve_safe_connect_host(host)
-                    remote_r, remote_w = await asyncio.open_connection(connect_host, port)
+                    remote_r, remote_w = await open_safe_connection(host, port)
                 except PermissionError as pe:
                     body = f"Blocked by sandbox security policy: {pe}\n"
                     body_bytes = body.encode("utf-8")
@@ -289,7 +316,9 @@ class FilteringProxyServer:
 
                 t1 = asyncio.create_task(pipe(client_r, remote_w))
                 t2 = asyncio.create_task(pipe(remote_r, client_w))
-                await asyncio.gather(t1, t2, return_exceptions=True)
+                done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
 
             else:
                 # Plain HTTP (GET http://host:port/path HTTP/1.1)
@@ -298,11 +327,11 @@ class FilteringProxyServer:
                 while True:
                     hdr = await client_r.readline()
                     if not hdr or hdr in (b"\r\n", b"\n"):
-                        headers.append(b"\r\n")
                         break
-                    headers.append(hdr)
                     if hdr.lower().startswith(b"host:"):
                         host_hdr = hdr.decode("utf-8", "replace").split(":", 1)[1].strip()
+                    elif not hdr.lower().startswith(b"connection:") and not hdr.lower().startswith(b"proxy-connection:"):
+                        headers.append(hdr)
 
                 target_spec = ""
                 if target.startswith("http://"):
@@ -339,9 +368,11 @@ class FilteringProxyServer:
                     proto = parts[2] if len(parts) > 2 else "HTTP/1.1"
                     headers[0] = f"{method} {path} {proto}\r\n".encode("utf-8")
 
+                # Force Connection: close to prevent lingering keep-alive sockets in plain HTTP
+                headers.append(b"Connection: close\r\n\r\n")
+
                 try:
-                    connect_host = await resolve_safe_connect_host(host)
-                    remote_r, remote_w = await asyncio.open_connection(connect_host, port)
+                    remote_r, remote_w = await open_safe_connection(host, port)
                 except PermissionError as pe:
                     body = f"Blocked by sandbox security policy: {pe}\n"
                     body_bytes = body.encode("utf-8")
@@ -376,7 +407,9 @@ class FilteringProxyServer:
 
                 t1 = asyncio.create_task(pipe(client_r, remote_w))
                 t2 = asyncio.create_task(pipe(remote_r, client_w))
-                await asyncio.gather(t1, t2, return_exceptions=True)
+                done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
 
         except Exception:
             pass
@@ -440,7 +473,9 @@ async def run_relay(tcp_port, sock_path):
 
         t1 = asyncio.create_task(pipe(client_r, unix_w))
         t2 = asyncio.create_task(pipe(unix_r, client_w))
-        await asyncio.gather(t1, t2, return_exceptions=True)
+        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
 
     server = await asyncio.start_server(handle_tcp, "127.0.0.1", tcp_port)
 
