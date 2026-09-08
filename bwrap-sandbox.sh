@@ -831,12 +831,18 @@ if [ "$ALLOW_NET_FILTERED" = true ]; then
             python3 "'"$SANDBOX_NET_RELAY"'" --relay '"$SANDBOX_PROXY_PORT"' "'"$SANDBOX_NET_SOCK"'" >/dev/null 2>&1 &
         fi
         RELAY_PID=$!
+        TRIES=0
         while ! (echo > /dev/tcp/127.0.0.1/'"$SANDBOX_PROXY_PORT"') 2>/dev/null; do
             if ! kill -0 "$RELAY_PID" 2>/dev/null; then
                 echo "Error: Failed to start sandbox network relay." >&2
                 exit 1
             fi
-            sleep 0.01
+            TRIES=$((TRIES + 1))
+            if [ "$TRIES" -ge 100 ]; then
+                echo "Error: Timed out waiting for sandbox network relay on port '"$SANDBOX_PROXY_PORT"'." >&2
+                exit 1
+            fi
+            sleep 0.05
         done
         exec "$@"
     '
