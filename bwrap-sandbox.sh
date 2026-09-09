@@ -92,7 +92,7 @@ TITLE_RESTORE_NEEDED=false
 
 cleanup() {
     local sig="${1:-0}"
-    trap - EXIT INT TERM HUP
+    trap - EXIT INT TERM HUP WINCH
 
     if [ "$TITLE_RESTORE_NEEDED" = true ] && { [ -t 1 ] || [ -t 2 ]; }; then
         # Restore terminal window title from stack
@@ -141,10 +141,38 @@ cleanup() {
         kill -s "$sig" $$ 2>/dev/null || exit $((128 + sig))
     fi
 }
+
+# ------------------------------------------------------------------------------
+# Terminal Window Resize Signal Forwarder (SIGWINCH)
+# Relays window geometry change signals from the host terminal to the sandboxed
+# process group without breaking session isolation (--new-session / anti-TIOCSTI).
+# ------------------------------------------------------------------------------
+forward_winch() {
+    if [ -n "${BWRAP_PID:-}" ]; then
+        local children=""
+        if [ -f "/proc/$BWRAP_PID/task/$BWRAP_PID/children" ]; then
+            children="$(cat "/proc/$BWRAP_PID/task/$BWRAP_PID/children" 2>/dev/null || true)"
+        fi
+        if [ -z "$children" ] && command -v pgrep >/dev/null 2>&1; then
+            children="$(pgrep -P "$BWRAP_PID" 2>/dev/null || true)"
+        fi
+        for cpid in $children; do
+            kill -WINCH "-$cpid" 2>/dev/null || kill -WINCH "$cpid" 2>/dev/null || true
+            if command -v pkill >/dev/null 2>&1; then
+                pkill -WINCH -P "$cpid" 2>/dev/null || true
+            fi
+        done
+        if command -v pkill >/dev/null 2>&1; then
+            pkill -WINCH -P "$BWRAP_PID" 2>/dev/null || true
+        fi
+    fi
+}
+
 trap 'cleanup 0' EXIT
 trap 'cleanup 2' INT
 trap 'cleanup 15' TERM
 trap 'cleanup 1' HUP
+trap 'forward_winch' WINCH
 
 # ------------------------------------------------------------------------------
 # Mount Helper Function
@@ -747,6 +775,10 @@ BWRAP_ENV=(
     "--setenv" "GIT_CONFIG_PARAMETERS" "$GIT_CONFIG_OVERRIDE"
 )
 
+if [ -n "${COLORTERM:-}" ]; then
+    BWRAP_ENV+=("--setenv" "COLORTERM" "$COLORTERM")
+fi
+
 # ------------------------------------------------------------------------------
 # Secure D-Bus Filtering via xdg-dbus-proxy (Appended AFTER --clearenv)
 # ------------------------------------------------------------------------------
@@ -996,7 +1028,22 @@ fi
 EXIT_CODE=0
 bwrap "${BWRAP_ARGS[@]}" "${BWRAP_ENV[@]}" "${FINAL_CMD[@]}" <&0 &
 BWRAP_PID=$!
-wait "$BWRAP_PID" 2>/dev/null || EXIT_CODE=$?
+
+# Resilient wait loop: caught signals (such as SIGWINCH) cause 'wait' to return
+# immediately with exit code > 128 (156 for SIGWINCH). Loop until bwrap actually
+# terminates so window resizes do not prematurely kill the sandbox session.
+while kill -0 "$BWRAP_PID" 2>/dev/null; do
+    if wait "$BWRAP_PID" 2>/dev/null; then
+        EXIT_CODE=0
+        break
+    else
+        ret=$?
+        if ! kill -0 "$BWRAP_PID" 2>/dev/null; then
+            EXIT_CODE=$ret
+            break
+        fi
+    fi
+done
 BWRAP_PID=""
 
 exit "${EXIT_CODE:-0}"
