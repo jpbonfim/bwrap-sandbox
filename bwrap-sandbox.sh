@@ -204,6 +204,10 @@ expand_path() {
     elif [[ "$p" == "\${HOME}"* ]]; then
         p="$HOME${p#\$\{HOME\}}"
     fi
+    # If path is relative, resolve it against TARGET_DIR to ensure valid absolute sandbox binds
+    if [[ "$p" != /* ]]; then
+        p="$(cd "${TARGET_DIR:-$(pwd)}" 2>/dev/null && realpath -m "$p" 2>/dev/null || realpath -m "$p")"
+    fi
     printf "%s\n" "$p"
 }
 
@@ -734,6 +738,69 @@ if [ -d "$TARGET_DIR/.git" ]; then
 elif [ -f "$TARGET_DIR/.git" ]; then
     # Git worktree or submodule pointer file
     BWRAP_ARGS+=("--ro-bind" "$TARGET_DIR/.git" "$TARGET_DIR/.git")
+
+    # Resolve gitdir from pointer file (e.g. "gitdir: /path/to/gitdir" or "gitdir: ../path")
+    RAW_GITDIR=""
+    if grep -qE '^[[:space:]]*gitdir:[[:space:]]*' "$TARGET_DIR/.git" 2>/dev/null; then
+        RAW_GITDIR="$(sed -n -E 's/^[[:space:]]*gitdir:[[:space:]]*(.*)$/\1/p' "$TARGET_DIR/.git" | head -n 1)"
+        RAW_GITDIR="${RAW_GITDIR#"${RAW_GITDIR%%[![:space:]]*}"}"
+        RAW_GITDIR="${RAW_GITDIR%"${RAW_GITDIR##*[![:space:]]}"}"
+    fi
+
+    if [ -n "$RAW_GITDIR" ]; then
+        if [[ "$RAW_GITDIR" == /* ]]; then
+            WT_GITDIR="$(realpath -m "$RAW_GITDIR" 2>/dev/null || echo "$RAW_GITDIR")"
+        else
+            WT_GITDIR="$(cd "$TARGET_DIR" && realpath -m "$RAW_GITDIR" 2>/dev/null || echo "$TARGET_DIR/$RAW_GITDIR")"
+        fi
+
+        if [ -d "$WT_GITDIR" ]; then
+            # Determine common git dir (e.g. bare repo root or main repo .git)
+            COMMON_GITDIR="$WT_GITDIR"
+            if [ -f "$WT_GITDIR/commondir" ]; then
+                RAW_COMMONDIR="$(cat "$WT_GITDIR/commondir" 2>/dev/null || true)"
+                RAW_COMMONDIR="${RAW_COMMONDIR#"${RAW_COMMONDIR%%[![:space:]]*}"}"
+                RAW_COMMONDIR="${RAW_COMMONDIR%"${RAW_COMMONDIR##*[![:space:]]}"}"
+                if [ -n "$RAW_COMMONDIR" ]; then
+                    if [[ "$RAW_COMMONDIR" == /* ]]; then
+                        COMMON_GITDIR="$(realpath -m "$RAW_COMMONDIR" 2>/dev/null || echo "$RAW_COMMONDIR")"
+                    else
+                        COMMON_GITDIR="$(cd "$WT_GITDIR" && realpath -m "$RAW_COMMONDIR" 2>/dev/null || echo "$WT_GITDIR/$RAW_COMMONDIR")"
+                    fi
+                fi
+            fi
+
+            # Mount common gitdir (stores objects, refs, packed-refs, etc.)
+            if [ -d "$COMMON_GITDIR" ]; then
+                if [ -z "${MOUNT_PERMS["$COMMON_GITDIR"]:-}" ]; then
+                    BWRAP_ARGS+=("--bind" "$COMMON_GITDIR" "$COMMON_GITDIR")
+                fi
+                # Defend git hooks & config in common gitdir against agent poisoning
+                mkdir -p "$COMMON_GITDIR/hooks"
+                BWRAP_ARGS+=("--ro-bind" "$COMMON_GITDIR/hooks" "$COMMON_GITDIR/hooks")
+                if [ -f "$COMMON_GITDIR/config" ]; then
+                    BWRAP_ARGS+=("--ro-bind" "$COMMON_GITDIR/config" "$COMMON_GITDIR/config")
+                fi
+            fi
+
+            # Mount worktree-specific gitdir if distinct from common gitdir
+            if [ "$WT_GITDIR" != "$COMMON_GITDIR" ]; then
+                if [[ "$WT_GITDIR" != "$COMMON_GITDIR"/* ]] && [ -d "$WT_GITDIR" ]; then
+                    BWRAP_ARGS+=("--bind" "$WT_GITDIR" "$WT_GITDIR")
+                fi
+                # Defend pointer files and worktree config
+                if [ -f "$WT_GITDIR/commondir" ]; then
+                    BWRAP_ARGS+=("--ro-bind" "$WT_GITDIR/commondir" "$WT_GITDIR/commondir")
+                fi
+                if [ -f "$WT_GITDIR/gitdir" ]; then
+                    BWRAP_ARGS+=("--ro-bind" "$WT_GITDIR/gitdir" "$WT_GITDIR/gitdir")
+                fi
+                if [ -f "$WT_GITDIR/config.worktree" ]; then
+                    BWRAP_ARGS+=("--ro-bind" "$WT_GITDIR/config.worktree" "$WT_GITDIR/config.worktree")
+                fi
+            fi
+        fi
+    fi
 fi
 
 # ------------------------------------------------------------------------------
