@@ -12,7 +12,7 @@ While completely agent-agnostic, it was actively developed and battle-tested wit
 * **Ephemeral `$HOME` (`tmpfs`):** Masks your real home directory with a temporary in-RAM filesystem. Sensitive folders (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, shell histories) do not exist inside the sandbox.
 * **Composable Permission Profiles:** Combine multiple profiles (e.g., `-p dev-tools,antigravity`) with fine-grained Read-Only (`ro`) and Read-Write (`rw`) controls. If conflicting permissions arise, the last specified profile takes precedence.
 * **Filtered D-Bus Keyring Proxy:** Safely isolates Google OAuth and Secret Service tokens via `xdg-dbus-proxy`. Agents can query the GNOME Keyring without granting access to `systemd` or other host control interfaces.
-* **Modular Toolchain Access (`dev-tools`):** Exposes host compilers, package managers, and runtimes (`~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, etc.) strictly in **read-only** mode so the agent can build and test without corrupting toolchain binaries.
+* **Modular Toolchain Access (`dev-tools`):** Exposes host compilers, package managers, and runtimes (`~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `mise`, etc.) strictly in **read-only** mode so the agent can build and test without corrupting toolchain binaries.
 * **Strict Domain-Filtered Network Access (`-nf, --net-filtered`):** Enforces outbound domain whitelisting via an unshared network namespace (`--unshare-net`) and an ephemeral Unix domain socket proxy. Zero external port exposure on the host, blocks direct IP/raw-socket bypasses, and prevents lateral access to host `127.0.0.1` services.
 * **Network Isolation by Default:** Blocks all inbound and outbound network connectivity unless explicitly granted via `--net-filtered` (domain-whitelisted) or `--net` (unrestricted).
 * **Workspace Hardening:** Mounts only the target workspace as read-write. Protects against `.git/hooks` poisoning vectors by locking hook execution and paths.
@@ -201,7 +201,7 @@ Profiles govern which host paths, IPC mechanisms, and environment variables are 
 
 | Profile | Mounts / Permissions | Forwarded Environment Variables | Purpose |
 | --- | --- | --- | --- |
-| `dev-tools` | `~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `~/.rustup`, `~/.fnm`, `~/.volta`, `~/.bun/bin`, `~/go/bin` **[RO]** | *(None)* | Exposes host toolchains to compile and test without modifying binaries. |
+| `dev-tools` | `~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `~/.rustup`, `~/.fnm`, `~/.volta`, `~/.bun/bin`, `~/go/bin`, `~/.local/share/mise`, `~/.config/mise`, `~/.local/share/uv` **[RO]** | *(None)* | Exposes host toolchains to compile and test without modifying binaries. |
 | `antigravity` | `~/.antigravity` **[RW]**<br>`~/.gemini` **[RW]**<br>`~/.cache/ms-playwright-go` **[RO]**<br>`xdg-dbus-proxy` socket | `GEMINI_API_KEY`<br>`ANTIGRAVITY_*` | Preserves Antigravity/Gemini state and uses filtered D-Bus for Google OAuth / GNOME Keyring. |
 | `claude` | `~/.claude` **[RW]**<br>`~/.claude.json` **[RW]**<br>`~/.config/claude` **[RW]**<br>`~/.local/share/claude` **[RW]**<br>`~/.local/state/claude` **[RW]** | `ANTHROPIC_API_KEY` | Preserves Claude Code authentication and workspace session history. |
 | `openai` | *(None)* | `OPENAI_API_KEY` | Forwards OpenAI API credentials to tools that require them. |

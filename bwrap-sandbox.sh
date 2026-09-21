@@ -250,7 +250,7 @@ load_available_profiles() {
 
     if [ ! -f "$file" ]; then
         AVAILABLE_PROFILES=("dev-tools" "antigravity" "claude" "openai" "deepseek" "mistral" "groq" "none")
-        PROFILE_DESCRIPTIONS["dev-tools"]="Mounts host user toolchains (~/.cargo/bin, ~/.nvm, ~/.pyenv, etc.) [Read-Only]"
+        PROFILE_DESCRIPTIONS["dev-tools"]="Mounts host user toolchains (~/.cargo/bin, ~/.nvm, ~/.pyenv, mise, etc.) [Read-Only]"
         PROFILE_DESCRIPTIONS["antigravity"]="Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache [RO], and filters D-Bus Keyring/Notifications"
         PROFILE_DESCRIPTIONS["claude"]="Mounts ~/.claude, ~/.claude.json, and ~/.config/claude [Read-Write]"
         PROFILE_DESCRIPTIONS["openai"]="Forwards OpenAI API credentials"
@@ -346,6 +346,13 @@ apply_profile_fallback() {
             set_mount "ro" "$HOME/.volta"
             set_mount "ro" "$HOME/.bun/bin"
             set_mount "ro" "$HOME/go/bin"
+            set_mount "ro" "$HOME/.local/share/mise"
+            set_mount "ro" "$HOME/.local/share/mise/shims"
+            set_mount "ro" "$HOME/.local/share/mise/bin"
+            set_mount "ro" "$HOME/.config/mise"
+            set_mount "ro" "$HOME/.tool-versions"
+            set_mount "ro" "$HOME/.mise.toml"
+            set_mount "ro" "$HOME/.local/share/uv"
             ;;
         antigravity)
             set_mount "rw" "$HOME/.antigravity"
@@ -692,6 +699,60 @@ BWRAP_ARGS+=(
 # ------------------------------------------------------------------------------
 for profile in "${SELECTED_PROFILES[@]}"; do
     apply_profile "$profile"
+done
+
+# ------------------------------------------------------------------------------
+# Automatically Resolve Symlink Targets (e.g. Dotfiles Repositories)
+# If a mounted directory or file contains symlinks pointing outside the mount
+# (e.g. ~/.config/mise/config.toml -> ~/configs/.config/mise/config.toml),
+# mount the real target path read-only so the symlink does not break inside the sandbox.
+# ------------------------------------------------------------------------------
+is_mount_covered() {
+    local check_path="$1"
+    for existing in "${ORDERED_MOUNT_PATHS[@]}"; do
+        if [ "$check_path" = "$existing" ]; then
+            return 0
+        fi
+        if [ -d "$existing" ] && [[ "$check_path" == "$existing"/* ]]; then
+            return 0
+        fi
+    done
+    case "$check_path" in
+        /usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/lib64|/lib64/*|/sbin|/sbin/*|/etc|/etc/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*)
+            return 0
+            ;;
+    esac
+    if [[ "$check_path" == "$TARGET_DIR" || "$check_path" == "$TARGET_DIR"/* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+RESOLVED_SYMLINK_TARGETS=()
+for mp in "${ORDERED_MOUNT_PATHS[@]}"; do
+    if [ -h "$mp" ]; then
+        r="$(realpath "$mp" 2>/dev/null || true)"
+        if [ -n "$r" ] && [ -e "$r" ]; then
+            if ! is_mount_covered "$r"; then
+                RESOLVED_SYMLINK_TARGETS+=("$r")
+            fi
+        fi
+    elif [ -d "$mp" ]; then
+        while IFS= read -r l; do
+            r="$(realpath "$l" 2>/dev/null || true)"
+            if [ -n "$r" ] && [ -e "$r" ]; then
+                if ! is_mount_covered "$r"; then
+                    RESOLVED_SYMLINK_TARGETS+=("$r")
+                fi
+            fi
+        done < <(find "$mp" -maxdepth 3 -type l 2>/dev/null || true)
+    fi
+done
+
+for st in "${RESOLVED_SYMLINK_TARGETS[@]}"; do
+    if ! is_mount_covered "$st"; then
+        set_mount "ro" "$st"
+    fi
 done
 
 DETECTED_USER_PATHS=()
