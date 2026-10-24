@@ -495,6 +495,7 @@ apply_profile_fallback() {
             set_mount "ro" "$HOME/.local/bin/claude"
             set_mount "ro" "$HOME/.cache/ms-playwright"
             SELECTED_ENV_PATTERNS+=("ANTHROPIC_*" "CLAUDE_CODE_OAUTH_TOKEN")
+            ENABLE_DBUS_NOTIFICATIONS=true
             ;;
         openai)
             SELECTED_ENV_PATTERNS+=("OPENAI_API_KEY")
