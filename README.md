@@ -89,6 +89,7 @@ Supported directives:
 * `description = <text>`: Summary shown in `--list-profiles`.
 * `mount = <ro|rw>:<path>`: Directory or file to bind-mount. Supports `~` and `$HOME` expansion. Repeatable.
 * `env = <NAME|PATTERN_*>`: Environment variable(s) to forward from the host. Supports wildcards (e.g., `ANTIGRAVITY_*`). Repeatable.
+* `setenv = <NAME>=<VALUE>`: Fixed environment variable set inside the sandbox regardless of the host environment (e.g., `DISABLE_AUTOUPDATER=1`). Repeatable.
 * `dbus_auth = true|false`: Enables filtered D-Bus proxy access to Secret Service / Keyring tokens (`org.freedesktop.secrets`, `org.gnome.keyring`).
 * `dbus_notifications = true|false`: Enables filtered D-Bus proxy access to desktop notifications (`org.freedesktop.Notifications`).
 
@@ -159,22 +160,31 @@ Run Antigravity with your host compilers, persistent credentials, and network st
 
 ```
 
-### 3. Run Claude Code with Custom Domain Whitelist
+### 3. Run Claude Code with Domain-Filtered Internet
+
+Run Claude Code with host toolchains, persistent sessions/credentials, and network constrained to whitelisted APIs:
+
+```bash
+./bwrap-sandbox.sh -p dev-tools,claude -nf -- claude --dangerously-skip-permissions
+```
+
+Notes for the `claude` profile:
+* **Authentication:** On Linux, Claude Code stores OAuth credentials in `~/.claude/.credentials.json`, which is shared with the host, so no keyring/D-Bus access is required. If you are already logged in on the host, the sandbox reuses that session (token refreshes go through `platform.claude.com`, included in the default whitelist). To log in from inside the sandbox, run `/login`: the browser cannot be launched from the sandbox, so open the printed URL on the host and paste the authorization code back into the terminal. API key users can export `ANTHROPIC_API_KEY` instead (all `ANTHROPIC_*` variables and `CLAUDE_CODE_OAUTH_TOKEN` are forwarded).
+* **Updates:** The Claude Code installation (`~/.local/share/claude`) is mounted read-write for convenience, so Claude Code can update itself. This also means the agent can modify the executable you run on the host.
+
+> [!WARNING]
+> **Agent self-configuration attacks:** Any profile that mounts an agent's configuration directory read-write (e.g. `~/.claude`, `~/.claude.json`, `~/.gemini`) lets the agent, or a prompt injection steering it, rewrite its own configuration. Hooks, MCP servers, plugins, skills and instruction files (`CLAUDE.md`) can all execute commands or alter the agent's behavior, which enables two attack paths:
+> * **Host execution:** if you ever run the agent **outside** the sandbox, a hook or MCP server planted from inside it runs on your host with full user privileges (SSH keys, browser sessions, shell profiles).
+> * **Cross-project persistence:** because the configuration directory is shared, a payload planted while working on project A also runs in later sandboxed sessions for project B, breaking the isolation between workspaces.
+>
+> The same applies to project-level configuration inside the workspace (e.g. `<project>/.claude/settings.json`). Mitigations: run the agent only through the sandbox, review configuration changes periodically (e.g. keep the config directory under Git and inspect `git diff`), mount sensitive files such as `~/.claude/settings.json` read-only (see `profiles.conf`), or point the sandbox at a dedicated configuration directory (e.g. `CLAUDE_CONFIG_DIR`) that is separate from the one your host agent uses.
+
+### 4. Run Claude Code with Custom Domain Whitelist
 
 Run Claude Code with host toolchains and a custom domain whitelist file:
 
 ```bash
 ./bwrap-sandbox.sh -p dev-tools,claude -nf -w ./my-domains.txt -- claude
-
-```
-
-### 4. Run Claude Code Offline
-
-Allow Claude Code to refactor, run tests, and inspect code locally without outbound internet access:
-
-```bash
-./bwrap-sandbox.sh -p dev-tools,claude -- claude
-
 ```
 
 ### 5. Run Unrestricted Build / Download Commands
@@ -203,7 +213,7 @@ Profiles govern which host paths, IPC mechanisms, and environment variables are 
 | --- | --- | --- | --- |
 | `dev-tools` | `~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `~/.rustup`, `~/.fnm`, `~/.volta`, `~/.bun/bin`, `~/go/bin`, `~/.local/share/mise`, `~/.config/mise`, `~/.local/share/uv` **[RO]** | *(None)* | Exposes host toolchains to compile and test without modifying binaries. |
 | `antigravity` | `~/.antigravity` **[RW]**<br>`~/.gemini` **[RW]**<br>`~/.cache/ms-playwright-go` **[RO]**<br>`xdg-dbus-proxy` socket | `GEMINI_API_KEY`<br>`ANTIGRAVITY_*` | Preserves Antigravity/Gemini state and uses filtered D-Bus for Google OAuth / GNOME Keyring. |
-| `claude` | `~/.claude` **[RW]**<br>`~/.claude.json` **[RW]**<br>`~/.config/claude` **[RW]**<br>`~/.local/share/claude` **[RW]**<br>`~/.local/state/claude` **[RW]** | `ANTHROPIC_API_KEY` | Preserves Claude Code authentication and workspace session history. |
+| `claude` | `~/.claude` **[RW]**<br>`~/.claude.json` **[RW]**<br>`~/.local/state/claude` **[RW]**<br>`~/.local/share/claude` **[RW]**<br>`~/.local/bin/claude` **[RO]**<br>`~/.cache/ms-playwright` **[RO]** | `ANTHROPIC_*`<br>`CLAUDE_CODE_OAUTH_TOKEN` | Preserves Claude Code OAuth credentials, session history and installation. |
 | `openai` | *(None)* | `OPENAI_API_KEY` | Forwards OpenAI API credentials to tools that require them. |
 | `deepseek` | *(None)* | `DEEPSEEK_API_KEY` | Forwards DeepSeek API credentials. |
 | `mistral` | *(None)* | `MISTRAL_API_KEY` | Forwards Mistral API credentials. |
@@ -215,8 +225,8 @@ Profiles govern which host paths, IPC mechanisms, and environment variables are 
 To prevent credential leakage and uphold the principle of least privilege, environment variables are passed into the sandbox **only** if they are explicitly matched by an `env` directive in one of the active profiles:
 
 * Running `./bwrap-sandbox.sh -p dev-tools -- cargo build` passes **zero** API keys into the sandbox.
-* Running `./bwrap-sandbox.sh -p claude -- claude` passes only `ANTHROPIC_API_KEY`, keeping your other credentials hidden.
-* Running `./bwrap-sandbox.sh -p claude,openai -- my-script` passes both `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
+* Running `./bwrap-sandbox.sh -p claude -- claude` passes only `ANTHROPIC_*` and `CLAUDE_CODE_OAUTH_TOKEN`, keeping your other credentials hidden.
+* Running `./bwrap-sandbox.sh -p claude,openai -- my-script` passes both the Anthropic variables and `OPENAI_API_KEY`.
 * Profiles support wildcards (`env = ANTIGRAVITY_*`), forwarding all matching exported host variables.
 
 Inspect current profiles and descriptions:

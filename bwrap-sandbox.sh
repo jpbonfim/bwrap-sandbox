@@ -74,6 +74,7 @@ WHITELIST_EXAMPLE="$SCRIPT_DIR/allowed-domains.example.txt"
 AVAILABLE_PROFILES=()
 declare -A PROFILE_DESCRIPTIONS=()
 SELECTED_ENV_PATTERNS=()
+SELECTED_SETENV=()             # Fixed "NAME=VALUE" assignments declared via 'setenv'
 
 # Data structures for profile mounts & permissions
 declare -A MOUNT_PERMS=()       # Path -> "ro" | "rw" (Last profile wins)
@@ -252,7 +253,7 @@ load_available_profiles() {
         AVAILABLE_PROFILES=("dev-tools" "antigravity" "claude" "openai" "deepseek" "mistral" "groq" "none")
         PROFILE_DESCRIPTIONS["dev-tools"]="Mounts host user toolchains (~/.cargo/bin, ~/.nvm, ~/.pyenv, mise, etc.) [Read-Only]"
         PROFILE_DESCRIPTIONS["antigravity"]="Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache [RO], and filters D-Bus Keyring/Notifications"
-        PROFILE_DESCRIPTIONS["claude"]="Mounts ~/.claude, ~/.claude.json, and ~/.config/claude [Read-Write]"
+        PROFILE_DESCRIPTIONS["claude"]="Mounts ~/.claude, ~/.claude.json and Claude Code installation [RW], Playwright cache [RO]"
         PROFILE_DESCRIPTIONS["openai"]="Forwards OpenAI API credentials"
         PROFILE_DESCRIPTIONS["deepseek"]="Forwards DeepSeek API credentials"
         PROFILE_DESCRIPTIONS["mistral"]="Forwards Mistral API credentials"
@@ -321,6 +322,10 @@ apply_profile_from_config() {
                 env_pat="${env_pat#"${env_pat%%[![:space:]]*}"}"
                 env_pat="${env_pat%"${env_pat##*[![:space:]]}"}"
                 SELECTED_ENV_PATTERNS+=("$env_pat")
+            elif [[ "$line" =~ ^setenv[[:space:]]*=[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+                SELECTED_SETENV+=("${BASH_REMATCH[1]}=${BASH_REMATCH[2]}")
+            elif [[ "$line" =~ ^setenv[[:space:]]*= ]]; then
+                echo "Warning: Invalid setenv directive '$line' in profile '$profile' (expected 'setenv = NAME=VALUE'). Skipping." >&2
             elif [[ "$line" =~ ^dbus_auth[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
                 ENABLE_DBUS_AUTH=true
             elif [[ "$line" =~ ^dbus_notifications[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
@@ -366,10 +371,11 @@ apply_profile_fallback() {
         claude)
             set_mount "rw" "$HOME/.claude"
             set_mount "rw" "$HOME/.claude.json"
-            set_mount "rw" "$HOME/.config/claude"
-            set_mount "rw" "$HOME/.local/share/claude"
             set_mount "rw" "$HOME/.local/state/claude"
-            SELECTED_ENV_PATTERNS+=("ANTHROPIC_API_KEY")
+            set_mount "rw" "$HOME/.local/share/claude"
+            set_mount "ro" "$HOME/.local/bin/claude"
+            set_mount "ro" "$HOME/.cache/ms-playwright"
+            SELECTED_ENV_PATTERNS+=("ANTHROPIC_*" "CLAUDE_CODE_OAUTH_TOKEN")
             ;;
         openai)
             SELECTED_ENV_PATTERNS+=("OPENAI_API_KEY")
@@ -755,18 +761,43 @@ for st in "${RESOLVED_SYMLINK_TARGETS[@]}"; do
     fi
 done
 
+# A file mount is redundant when a parent directory is already mounted with the same mode
+# (e.g. ~/.local/bin/claude from 'claude' and ~/.local/bin from 'dev-tools'). Binding it anyway
+# would target a symlink inside the parent mount and break bwrap.
+is_redundant_file_mount() {
+    local file_path="$1"
+    local file_mode="${MOUNT_PERMS["$file_path"]}"
+    [ -d "$file_path" ] && return 1
+    for existing in "${ORDERED_MOUNT_PATHS[@]}"; do
+        if [ -d "$existing" ] && [[ "$file_path" == "$existing"/* ]] && [ "${MOUNT_PERMS["$existing"]}" = "$file_mode" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 DETECTED_USER_PATHS=()
 
 for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
     mode="${MOUNT_PERMS["$target_path"]}"
+    if is_redundant_file_mount "$target_path"; then
+        continue
+    fi
     if [ "$mode" = "rw" ]; then
         BWRAP_ARGS+=("--bind" "$target_path" "$target_path")
     elif [ "$mode" = "ro" ]; then
         BWRAP_ARGS+=("--ro-bind" "$target_path" "$target_path")
     fi
 
+    path_entry=""
     if [[ ("$target_path" == *"bin"* || "$target_path" == *"shims"*) && -d "$target_path" ]]; then
-        DETECTED_USER_PATHS+=("$target_path")
+        path_entry="$target_path"
+    elif [ -f "$target_path" ] && [ -x "$target_path" ] && [[ "$(basename "$(dirname "$target_path")")" == "bin" ]]; then
+        # Single executable mounted on its own (e.g. ~/.local/bin/claude): expose its parent bin directory
+        path_entry="$(dirname "$target_path")"
+    fi
+    if [ -n "$path_entry" ] && [[ " ${DETECTED_USER_PATHS[*]} " != *" $path_entry "* ]]; then
+        DETECTED_USER_PATHS+=("$path_entry")
     fi
 done
 
@@ -1107,6 +1138,11 @@ for pat in "${SELECTED_ENV_PATTERNS[@]}"; do
             fi
         fi
     fi
+done
+
+# Fixed per-profile assignments (setenv = NAME=VALUE) take precedence over forwarded host values
+for assignment in "${SELECTED_SETENV[@]}"; do
+    BWRAP_ENV+=("--setenv" "${assignment%%=*}" "${assignment#*=}")
 done
 
 # ------------------------------------------------------------------------------

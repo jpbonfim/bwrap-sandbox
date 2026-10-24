@@ -32,6 +32,11 @@ anthropic.com
 *.anthropic.com
 claude.ai
 *.claude.ai
+# OAuth login & token refresh (platform.claude.com)
+claude.com
+*.claude.com
+# Feature flags
+cdn.growthbook.io
 statsig.anthropic.com
 statsigapi.net
 *.statsigapi.net
