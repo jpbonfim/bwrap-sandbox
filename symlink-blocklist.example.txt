@@ -1,0 +1,97 @@
+# ==============================================================================
+# Security-Hardened Sandbox: Workspace Symlink Blocklist (--resolve-symlinks)
+# ==============================================================================
+# Host paths that are never mounted when resolving workspace symlinks that point
+# outside the project. A cloned repository may ship hostile links such as
+# 'keys -> ~/.ssh', so keep this list conservative.
+#
+# Format: [rw:]<path>
+#   <path>       # Blocked in every mode (--resolve-symlinks=ro and =rw)
+#   rw:<path>    # Blocked only when mounting read-write (--resolve-symlinks=rw)
+#
+# Rules:
+#   - Supports '~', '$HOME' and '$SANDBOX_DIR' (bwrap-sandbox installation directory).
+#   - Paths must be absolute after expansion.
+#   - A path also blocks every directory containing it (e.g. '~/.ssh' blocks links to '~' and '/').
+#   - Entries that are themselves symlinks (e.g. dotfiles) also block their real location.
+#   - Lines starting with '#' and empty lines are ignored.
+#
+# Always enforced regardless of this file: sockets, devices and FIFOs, targets
+# containing the workspace itself, and targets containing a profile mount.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Credentials, Keys & Secret Stores
+# ------------------------------------------------------------------------------
+~/.ssh
+~/.gnupg
+~/.aws
+~/.azure
+~/.kube
+~/.docker
+~/.config/gcloud
+~/.config/gh
+~/.password-store
+~/.local/share/keyrings
+~/.netrc
+~/.git-credentials
+~/.pgpass
+~/.npmrc
+~/.pypirc
+~/.cargo/credentials
+~/.cargo/credentials.toml
+~/.vault-token
+
+# ------------------------------------------------------------------------------
+# 2. AI Agent Configuration & OAuth Tokens
+# ------------------------------------------------------------------------------
+~/.claude
+~/.claude.json
+~/.gemini
+~/.antigravity
+
+# ------------------------------------------------------------------------------
+# 3. Browser Profiles (Cookies & Sessions)
+# ------------------------------------------------------------------------------
+~/.mozilla
+~/.config/google-chrome
+~/.config/chromium
+~/.config/BraveSoftware
+
+# ------------------------------------------------------------------------------
+# 4. Shell Startup Files, Histories & Git Identity (Often Export Tokens)
+# ------------------------------------------------------------------------------
+~/.bashrc
+~/.bash_profile
+~/.profile
+~/.bash_logout
+~/.zshrc
+~/.zshenv
+~/.zprofile
+~/.zlogin
+~/.config/fish
+~/.bash_history
+~/.zsh_history
+~/.gitconfig
+~/.config/git
+
+# ------------------------------------------------------------------------------
+# 5. System Internals
+# ------------------------------------------------------------------------------
+/root
+/boot
+/proc
+/sys
+/dev
+/run
+/var/run
+/etc
+
+# ------------------------------------------------------------------------------
+# 6. Host-Executed Locations (Blocked Read-Write Only)
+# ------------------------------------------------------------------------------
+rw:~/.local/bin
+rw:~/.config/systemd
+rw:~/.config/autostart
+# The sandbox itself: a writable script or whitelist would allow escaping on the next run
+rw:$SANDBOX_DIR

@@ -80,6 +80,8 @@ All profiles, permissions, and network domain rules are declarative and stored i
 | `profiles.conf` | Ignored by Git | Your active, locally editable profile configuration. |
 | `allowed-domains.example.txt` | Versioned in Git | Template listing standard agent endpoints (Google, Anthropic, NPM, etc.). |
 | `allowed-domains.txt` | Ignored by Git | Your active domain whitelist used by `-nf`. |
+| `symlink-blocklist.example.txt` | Versioned in Git | Template listing sensitive host paths (credentials, shell startup files, system paths, etc.). |
+| `symlink-blocklist.txt` | Ignored by Git | Your active blocklist of host paths never mounted by `--resolve-symlinks`. |
 
 ### Configuring Profiles (`profiles.conf`)
 
@@ -121,10 +123,14 @@ Options:
   -p, --profile NAME       Permission profile (Can be repeated or comma-separated)
       --list-profiles      List available permission profiles and descriptions
   -c, --config PATH        Path to profiles configuration file (Default: profiles.conf)
-      --init               Initialize profiles.conf and allowed-domains.txt from templates and exit
+      --init               Initialize profiles.conf, allowed-domains.txt and symlink-blocklist.txt from templates and exit
   -n, --net                Allow unrestricted network access (Default: OFF / isolated)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
   -g, --gui                Expose X11/Wayland display and clipboard (Warning: reduces isolation)
+      --resolve-symlinks[=ro|rw]
+                           Mount targets of workspace symlinks pointing outside the project
+                           ('read'/'write' are aliases; Default: ro; paths listed in
+                           symlink-blocklist.txt are never mounted)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
   -h, --help               Show this help message
@@ -202,6 +208,28 @@ Run Antigravity with domain-filtered internet and GUI display enabled (allowing 
 ```bash
 ./bwrap-sandbox.sh -p dev-tools,antigravity -nf -g -- agy
 ```
+
+### 7. Resolve Workspace Symlinks Pointing Outside the Project
+
+Only the workspace is mounted, so symlinks inside the project that point **outside** of it (shared libraries, `npm link` / `pip install -e` packages, files stored in another repository) are broken inside the sandbox. Symlinks pointing to other locations inside the project always work. `--resolve-symlinks` scans the workspace and mounts each external target:
+
+```bash
+# Read-only (default, same as --resolve-symlinks=ro or --resolve-symlinks=read)
+./bwrap-sandbox.sh -p dev-tools,claude -nf --resolve-symlinks -- claude
+
+# Read-write (same as --resolve-symlinks=write): the agent may also modify the symlink targets
+./bwrap-sandbox.sh -p dev-tools,claude -nf --resolve-symlinks=rw -- claude
+```
+
+Every mounted or refused symlink is reported on startup (`[+] Resolved workspace symlink ...` / `Warning: Skipping workspace symlink ...`). Rules applied:
+
+* **Blocklist (`symlink-blocklist.txt`):** host paths that are never mounted. The default template covers credentials and secrets (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, `~/.config/gh`, `~/.netrc`, `~/.npmrc`, keyrings, agent configs such as `~/.claude` and `~/.gemini`), browser profiles, shell startup files and histories (`~/.zshrc`, `~/.bashrc`, ...), `~/.gitconfig` and system paths (`/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/root`, `/boot`). Entries prefixed with `rw:` are only refused in `rw` mode; the template uses it for host-executed locations (`~/.local/bin`, `~/.config/systemd`, `~/.config/autostart`) and the `bwrap-sandbox` installation directory itself (`$SANDBOX_DIR`). A blocked path also blocks every directory **containing** it (e.g. a link to `~` or `/`), and entries that are themselves symlinks (e.g. `~/.zshrc` managed by a dotfiles repository) also block their real location. If the blocklist file is missing, `--resolve-symlinks` refuses to run.
+* **Always refused (built-in):** sockets, devices and FIFOs; targets containing the workspace (e.g. `link -> ..`), which would expose sibling projects; and targets containing a profile mount, which would override its `ro`/`rw` mode.
+* **Skipped:** targets already visible in the sandbox (system directories or profile mounts keep the mode set by the profile), broken symlinks and anything inside `.git`.
+* Symlinks are resolved once at startup and only one level deep: symlinks created later by the agent, or nested inside a mounted target, are not resolved.
+
+> [!WARNING]
+> A cloned repository can ship hostile symlinks (e.g. `keys -> ~/.ssh`). The blocklist is best-effort, so review the startup report and only use `--resolve-symlinks` on projects you trust. Prefer the default `ro` mode; `rw` lets the agent modify files outside the workspace that your host may later execute or trust (scripts, build files, other repositories). For a permanent, explicit setup, a `mount = ro:<path>` entry in a custom profile is the safer alternative.
 
 ---
 
@@ -284,6 +312,7 @@ Inspect current profiles and descriptions:
 * **Process Termination Assurance (`--die-with-parent`):** If the parent shell or terminal terminates, the Linux kernel terminates every subprocess inside the sandbox namespace.
 * **Automatic Resource Cleanup:** A bash `trap` cleans up the `xdg-dbus-proxy` and `net-proxy.py` background processes and removes temporary directories (`/tmp/bwrap-dbus-*`, `/tmp/bwrap-net-*`) upon exit.
 * **Declarative Per-Profile Secret Scoping:** The sandbox runs `--clearenv` to scrub all host environment variables. Unlike traditional wrappers that unconditionally pass all API keys whenever network is enabled, `bwrap-sandbox` inspects the active profiles defined in `profiles.conf` and injects *only* the specific variables declared for those profiles (supporting exact names and wildcards). Toolchains, build runners, and unselected agents run with zero exposed keys.
+* **Opt-in Workspace Symlink Resolution (`--resolve-symlinks`):** External symlink targets are never mounted implicitly. When requested, targets are mounted read-only by default, while paths listed in the configurable `symlink-blocklist.txt` (credentials, shell startup files, system paths, etc.), sockets and any directory containing them are always refused (see [example 7](#7-resolve-workspace-symlinks-pointing-outside-the-project)).
 * **Usr-Merge Compatibility:** Automatically identifies and maps relative symlinks for `/bin`, `/sbin`, `/lib`, and `/lib64`, preventing mount failure on modern Debian, Ubuntu, and Arch Linux distributions.
 
 ---

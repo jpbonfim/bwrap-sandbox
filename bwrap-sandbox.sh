@@ -10,6 +10,7 @@ set -euo pipefail
 ALLOW_NET=false
 ALLOW_NET_FILTERED=false
 ALLOW_GUI=false
+RESOLVE_SYMLINKS=""            # "" (disabled) | "ro" | "rw"
 WHITELIST_FILE=""
 TARGET_DIR="$(pwd)"
 SELECTED_PROFILES=()
@@ -69,6 +70,9 @@ PROFILES_FILE="$DEFAULT_PROFILES_FILE"
 
 DEFAULT_WHITELIST="$SCRIPT_DIR/allowed-domains.txt"
 WHITELIST_EXAMPLE="$SCRIPT_DIR/allowed-domains.example.txt"
+
+DEFAULT_SYMLINK_BLOCKLIST="$SCRIPT_DIR/symlink-blocklist.txt"
+SYMLINK_BLOCKLIST_EXAMPLE="$SCRIPT_DIR/symlink-blocklist.example.txt"
 
 # Data structures for profile discovery & configuration
 AVAILABLE_PROFILES=()
@@ -231,15 +235,23 @@ ensure_configs() {
         created_any=true
     fi
 
+    if [ ! -f "$DEFAULT_SYMLINK_BLOCKLIST" ] && [ -f "$SYMLINK_BLOCKLIST_EXAMPLE" ]; then
+        cp "$SYMLINK_BLOCKLIST_EXAMPLE" "$DEFAULT_SYMLINK_BLOCKLIST"
+        echo "[+] Initialized symlink blocklist: $DEFAULT_SYMLINK_BLOCKLIST"
+        created_any=true
+    fi
+
     if [ "$explicit_init" = true ]; then
         if [ "$created_any" = false ]; then
             echo "[i] Configuration files already exist:"
             echo "    Profiles:  $DEFAULT_PROFILES_FILE"
             echo "    Whitelist: $DEFAULT_WHITELIST"
+            echo "    Symlink blocklist: $DEFAULT_SYMLINK_BLOCKLIST"
         else
             echo "[✔] Initialization complete."
-            echo "    You can now customize your profiles in '$DEFAULT_PROFILES_FILE'"
-            echo "    and your domain whitelist in '$DEFAULT_WHITELIST'."
+            echo "    You can now customize your profiles in '$DEFAULT_PROFILES_FILE',"
+            echo "    your domain whitelist in '$DEFAULT_WHITELIST'"
+            echo "    and your symlink blocklist in '$DEFAULT_SYMLINK_BLOCKLIST'."
         fi
     fi
 }
@@ -445,10 +457,14 @@ Options:
   -p, --profile NAME       Permission profile (Can be repeated or comma-separated)
       --list-profiles      List available permission profiles and descriptions
   -c, --config PATH        Path to profiles configuration file (Default: profiles.conf)
-      --init               Initialize profiles.conf and allowed-domains.txt from templates and exit
+      --init               Initialize profiles.conf, allowed-domains.txt and symlink-blocklist.txt from templates and exit
   -n, --net                Allow unrestricted network access (Default: OFF / isolated)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
   -g, --gui                Expose X11/Wayland display and clipboard (Warning: reduces isolation)
+      --resolve-symlinks[=ro|rw]
+                           Mount targets of workspace symlinks pointing outside the project
+                           ('read'/'write' are aliases; Default: ro; paths listed in
+                           symlink-blocklist.txt are never mounted)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
   -h, --help               Show this help message
@@ -461,6 +477,7 @@ Examples:
   $(basename "$0") -p dev-tools,claude -nf -- claude
   $(basename "$0") -p dev-tools,claude -nf -w ./my-domains.txt -- claude
   $(basename "$0") -p dev-tools --net -- cargo build
+  $(basename "$0") -p dev-tools,claude -nf --resolve-symlinks -- claude
 EOF
     exit 0
 }
@@ -551,6 +568,21 @@ while [[ $# -gt 0 ]]; do
         ALLOW_GUI=true
         shift
         ;;
+    --resolve-symlinks)
+        RESOLVE_SYMLINKS="ro"
+        shift
+        ;;
+    --resolve-symlinks=*)
+        case "${1#*=}" in
+            ro | read) RESOLVE_SYMLINKS="ro" ;;
+            rw | write) RESOLVE_SYMLINKS="rw" ;;
+            *)
+                echo "Error: Invalid value '${1#*=}' for '--resolve-symlinks' (expected 'ro'/'read' or 'rw'/'write')." >&2
+                exit 1
+                ;;
+        esac
+        shift
+        ;;
     -w | --whitelist)
         if [[ $# -lt 2 || "$2" == "--" ]]; then
             echo "Error: Option '$1' requires an argument." >&2
@@ -594,6 +626,13 @@ if [ "$ALLOW_NET_FILTERED" = true ]; then
         echo "Error: Whitelist file not found: '$WHITELIST_FILE'" >&2
         exit 1
     fi
+fi
+
+# Never resolve workspace symlinks without a blocklist
+if [ -n "$RESOLVE_SYMLINKS" ] && [ ! -f "$DEFAULT_SYMLINK_BLOCKLIST" ]; then
+    echo "Error: Symlink blocklist not found: '$DEFAULT_SYMLINK_BLOCKLIST'" >&2
+    echo "Run '$(basename "$0") --init' to create it from the template." >&2
+    exit 1
 fi
 
 # Resolve absolute path for workspace
@@ -805,6 +844,181 @@ done
 CLEAN_PATH="/usr/local/bin:/usr/bin:/bin"
 if [ ${#DETECTED_USER_PATHS[@]} -gt 0 ]; then
     CLEAN_PATH="$(IFS=:; echo "${DETECTED_USER_PATHS[*]}"):$CLEAN_PATH"
+fi
+
+# ------------------------------------------------------------------------------
+# Workspace Symlink Resolution (--resolve-symlinks)
+# Symlinks inside the project pointing outside of it (e.g. shared libraries,
+# 'npm link' packages, files kept in a dotfiles repository) are broken inside
+# the sandbox because their targets are not mounted. When enabled, each external
+# target is mounted in the requested mode, refusing sensitive host paths since a
+# cloned repository may contain hostile links (e.g. 'keys -> ~/.ssh').
+# ------------------------------------------------------------------------------
+# Usage: path_within <parent> <path> (true if path is parent or lies inside it)
+path_within() {
+    [ "$1" = "/" ] || [ "$2" = "$1" ] || [[ "$2" == "$1"/* ]]
+}
+
+# Lexically normalizes an absolute path (resolves '.' and '..' without following symlinks)
+# into NORMALIZED_PATH, avoiding a subprocess per symlink on large workspaces.
+normalize_path() {
+    local part IFS='/'
+    local -a parts=() out=()
+    # Split on '/' via word splitting with globbing disabled (no here-string temp file per call)
+    set -f
+    parts=($1)
+    set +f
+    for part in "${parts[@]}"; do
+        case "$part" in
+            "" | .) ;;
+            ..) [ ${#out[@]} -gt 0 ] && unset 'out[-1]' ;;
+            *) out+=("$part") ;;
+        esac
+    done
+    NORMALIZED_PATH="/${out[*]}"
+}
+
+SYMLINK_BLOCKED_PATHS=()       # Never mounted, neither directly nor through a parent directory
+SYMLINK_RW_BLOCKED_PATHS=()    # Additionally refused when mounting read-write
+
+# Loads symlink-blocklist.txt ('<path>' blocks every mode, 'rw:<path>' blocks read-write only)
+load_symlink_blocklist() {
+    local file="$1"
+    local line raw_path resolved rw_only entry
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+        raw_path="$line"
+        rw_only=false
+        if [[ "$line" =~ ^rw:(.*)$ ]]; then
+            rw_only=true
+            raw_path="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[a-zA-Z]+: ]]; then
+            echo "Warning: Invalid prefix in symlink blocklist entry '$line' (only 'rw:' is supported). Skipping." >&2
+            continue
+        fi
+        raw_path="${raw_path#"${raw_path%%[![:space:]]*}"}"
+        raw_path="${raw_path//\$\{SANDBOX_DIR\}/$SCRIPT_DIR}"
+        raw_path="${raw_path//\$SANDBOX_DIR/$SCRIPT_DIR}"
+
+        if [[ "$raw_path" != /* && "$raw_path" != "~" && "$raw_path" != "~/"* && "$raw_path" != "\$HOME"* && "$raw_path" != "\${HOME}"* ]]; then
+            echo "Warning: Symlink blocklist entry '$line' is not an absolute path. Skipping." >&2
+            continue
+        fi
+        normalize_path "$(expand_path "$raw_path")"
+        # Entries that are themselves symlinks (e.g. ~/.zshrc -> ~/dotfiles/zshrc) also block their real location
+        resolved="$(realpath -q -e -- "$NORMALIZED_PATH" 2>/dev/null || true)"
+        for entry in "$NORMALIZED_PATH" "$resolved"; do
+            [ -z "$entry" ] && continue
+            if [ "$rw_only" = true ]; then
+                SYMLINK_RW_BLOCKED_PATHS+=("$entry")
+            else
+                SYMLINK_BLOCKED_PATHS+=("$entry")
+            fi
+        done
+    done < "$file"
+}
+
+# Prints the reason a symlink target must not be mounted (returns 1 if allowed)
+symlink_block_reason() {
+    local p="$1"
+    local blocked
+    for blocked in "${SYMLINK_BLOCKED_PATHS[@]}"; do
+        if path_within "$blocked" "$p" || path_within "$p" "$blocked"; then
+            echo "blocked host path '$blocked'"
+            return 0
+        fi
+    done
+    if [ "$RESOLVE_SYMLINKS" = "rw" ]; then
+        for blocked in "${SYMLINK_RW_BLOCKED_PATHS[@]}"; do
+            if path_within "$blocked" "$p" || path_within "$p" "$blocked"; then
+                echo "path '$blocked' is blocked for read-write mounts"
+                return 0
+            fi
+        done
+    fi
+    if path_within "$p" "$TARGET_DIR"; then
+        echo "target contains the workspace itself"
+        return 0
+    fi
+    # Mounting a parent of a profile mount would shadow it (and override its ro/rw mode)
+    for blocked in "${ORDERED_MOUNT_PATHS[@]}"; do
+        if [ "$p" != "$blocked" ] && path_within "$p" "$blocked"; then
+            echo "target contains profile mount '$blocked'"
+            return 0
+        fi
+    done
+    return 1
+}
+
+declare -A WORKSPACE_LINK_SOURCES=() # Sandbox destination (path the link points to) -> resolved host source
+
+if [ -n "$RESOLVE_SYMLINKS" ]; then
+    load_symlink_blocklist "$DEFAULT_SYMLINK_BLOCKLIST"
+
+    while IFS= read -r -d '' link && IFS= read -r -d '' raw_target; do
+        [ -z "$raw_target" ] && continue
+        if [[ "$raw_target" != /* ]]; then
+            raw_target="${link%/*}/$raw_target"
+        fi
+        normalize_path "$raw_target"
+        dest="$NORMALIZED_PATH"
+
+        # Internal links already work (chains through the workspace are handled by the next link)
+        if path_within "$TARGET_DIR" "$dest" || [ -n "${WORKSPACE_LINK_SOURCES["$dest"]:-}" ]; then
+            continue
+        fi
+
+        # Already visible inside the sandbox (system directories or profile mounts keep their own mode)
+        if is_mount_covered "$dest"; then
+            continue
+        fi
+
+        rel_link="${link#"$TARGET_DIR"/}"
+        src="$(realpath -e "$link" 2>/dev/null || true)"
+        if [ -z "$src" ]; then
+            continue # Broken on the host as well
+        fi
+
+        if [ -S "$src" ] || [ -b "$src" ] || [ -c "$src" ] || [ -p "$src" ]; then
+            reason="sockets, devices and FIFOs are never exposed"
+        else
+            # Check both the path the link points to and its fully resolved location
+            reason="$(symlink_block_reason "$dest" || symlink_block_reason "$src" || true)"
+        fi
+
+        if [ -n "$reason" ]; then
+            echo "Warning: Skipping workspace symlink '$rel_link' -> '$dest': $reason." >&2
+            continue
+        fi
+
+        WORKSPACE_LINK_SOURCES["$dest"]="$src"
+        echo "[+] Resolved workspace symlink '$rel_link' -> '$dest' [$RESOLVE_SYMLINKS]" >&2
+    done < <(find "$TARGET_DIR" -name .git -prune -o -type l -printf '%p\0%l\0' 2>/dev/null || true)
+
+    # Mount parents before children, skipping targets already covered by a mounted parent directory
+    mounted_link_dirs=()
+    while IFS= read -r -d '' dest; do
+        [ -z "$dest" ] && continue
+        covered=false
+        for parent_dir in "${mounted_link_dirs[@]}"; do
+            if path_within "$parent_dir" "$dest"; then
+                covered=true
+                break
+            fi
+        done
+        [ "$covered" = true ] && continue
+
+        src="${WORKSPACE_LINK_SOURCES["$dest"]}"
+        if [ "$RESOLVE_SYMLINKS" = "rw" ]; then
+            BWRAP_ARGS+=("--bind" "$src" "$dest")
+        else
+            BWRAP_ARGS+=("--ro-bind" "$src" "$dest")
+        fi
+        [ -d "$src" ] && mounted_link_dirs+=("$dest")
+    done < <(printf '%s\0' "${!WORKSPACE_LINK_SOURCES[@]}" | sort -z)
 fi
 
 # ------------------------------------------------------------------------------

@@ -28,6 +28,7 @@ ENV/
 # Local active configuration and whitelist (versioned defaults are in *.example.*)
 profiles.conf
 allowed-domains.txt
+symlink-blocklist.txt
 *.local.conf
 *.local.txt
 custom-domains.txt
