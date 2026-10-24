@@ -90,6 +90,7 @@ Profiles use standard INI syntax. Any section `[profile-name]` automatically bec
 Supported directives:
 * `description = <text>`: Summary shown in `--list-profiles`.
 * `mount = <ro|rw>:<path>`: Directory or file to bind-mount. Supports `~` and `$HOME` expansion. Repeatable.
+* `protect = <path>[/]`: Mounts a path read-only, even inside a read-write mount (e.g. `~/.claude/settings.json` inside `~/.claude`). Since a missing path could otherwise be created by the agent, an empty placeholder is created on the host first (a directory when the path ends with `/`, otherwise a file, `{}` for `.json`), only if its parent directory exists. Protected paths cannot be modified, renamed or replaced. Symlinks (e.g. files managed by a dotfiles repository) cannot be mounted read-only because bwrap follows them, and the link itself stays replaceable through its writable parent directory: their real target is protected instead, and after the sandbox exits the link is verified. If it was replaced or removed, the link is restored and any replacement is kept as `<path>.sandbox-replaced.<timestamp>` for inspection (a warning is shown). Repeatable.
 * `env = <NAME|PATTERN_*>`: Environment variable(s) to forward from the host. Supports wildcards (e.g., `ANTIGRAVITY_*`). Repeatable.
 * `setenv = <NAME>=<VALUE>`: Fixed environment variable set inside the sandbox regardless of the host environment (e.g., `DISABLE_AUTOUPDATER=1`). Repeatable.
 * `dbus_auth = true|false`: Enables filtered D-Bus proxy access to Secret Service / Keyring tokens (`org.freedesktop.secrets`, `org.gnome.keyring`).
@@ -109,6 +110,23 @@ Once saved, `my-agent` will instantly appear in `--list-profiles` and can be inv
 ```bash
 ./bwrap-sandbox.sh -p dev-tools,my-agent -nf -- my-agent-cli
 ```
+
+### Profile Variants (`profile:variant`)
+
+A section named `[profile:variant]` defines a variant of `[profile]`, selected with `-p profile:variant`. Variants inherit their base profile: the base section is applied first and the variant's directives are layered on top, so a variant only lists what changes (on conflicting mounts, the last registration wins, e.g. `rw` in the base becomes `ro` in the variant). `--list-profiles` shows variants grouped under their base profile.
+
+```ini
+[my-agent:strict]
+description = Custom agent with read-only configuration
+protect = ~/.config/my-agent/hooks/
+mount = ro:~/.cache/huggingface
+```
+
+```bash
+./bwrap-sandbox.sh -p dev-tools,my-agent:strict -nf -- my-agent-cli
+```
+
+The default template ships `standard` (identical to the base profile, so `-p claude` and `-p claude:standard` are equivalent) and `strict` variants for `claude` and `antigravity`. The `:` separator needs no shell quoting, unlike brackets, which zsh treats as glob patterns.
 
 ---
 
@@ -133,10 +151,13 @@ Options:
                            symlink-blocklist.txt are never mounted)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
+      --log-level LEVEL    Log verbosity: error, warn, info or debug (Default: info; errors are always shown)
   -h, --help               Show this help message
 ```
 
 The `--` delimiter separates script options from the command passed to the sandbox.
+
+Use `--log-level debug` to inspect which profiles were applied and every mount with its `ro`/`rw` mode, or `--log-level warn`/`error` to silence informational reports.
 
 > [!WARNING]
 > **Security Implications of `--gui`:**
@@ -172,18 +193,23 @@ Run Claude Code with host toolchains, persistent sessions/credentials, and netwo
 
 ```bash
 ./bwrap-sandbox.sh -p dev-tools,claude -nf -- claude --dangerously-skip-permissions
+
+# Strict variant: hooks, settings, skills, agents, commands, plugins, instructions and binary are read-only
+./bwrap-sandbox.sh -p dev-tools,claude:strict -nf -- claude --dangerously-skip-permissions
 ```
 
 Notes for the `claude` profile:
 * **Authentication:** On Linux, Claude Code stores OAuth credentials in `~/.claude/.credentials.json`, which is shared with the host, so no keyring/D-Bus access is required. If you are already logged in on the host, the sandbox reuses that session (token refreshes go through `platform.claude.com`, included in the default whitelist). To log in from inside the sandbox, run `/login`: the browser cannot be launched from the sandbox, so open the printed URL on the host and paste the authorization code back into the terminal. API key users can export `ANTHROPIC_API_KEY` instead (all `ANTHROPIC_*` variables and `CLAUDE_CODE_OAUTH_TOKEN` are forwarded).
-* **Updates:** The Claude Code installation (`~/.local/share/claude`) is mounted read-write for convenience, so Claude Code can update itself. This also means the agent can modify the executable you run on the host.
+* **Updates:** The Claude Code installation (`~/.local/share/claude`) is mounted read-write for convenience, so Claude Code can update itself. This also means the agent can modify the executable you run on the host. The `strict` variant mounts it read-only and disables auto-updates (`DISABLE_AUTOUPDATER=1`); run `claude update` on the host instead.
+* **Strict variant (`claude:strict`):** protects the files an agent could use to persist or execute code: `~/.claude/settings.json` (hooks, statusline, permissions), `CLAUDE.md`, `skills/`, `agents/`, `commands/`, `output-styles/`, `plugins/`, `hooks/` (common location for hook scripts) and `chrome/` (the Claude in Chrome native messaging host, executed by the browser on the host). Sessions, history and OAuth credentials stay writable. Trade-offs: `/config`, `/model` and similar commands cannot persist settings, and plugins cannot be installed or synced. Not covered: MCP servers in `~/.claude.json` (Claude Code must write this file) and project-level configuration in the workspace (`.claude/`, `.mcp.json`), which shows up in `git diff`.
+* **Strict variant (`antigravity:strict`):** protects `~/.gemini/config/` (hooks, MCP config, skills, scripts, plugins; per-project state stays writable), the Antigravity CLI `settings.json`, global instructions (`GEMINI.md`, `AGENTS.md`), Antigravity executables (`~/.gemini/bin/`, `agentapi` helpers) and the IDE's `~/.antigravity/extensions/`, `bin/` and `argv.json`. In-sandbox updates will fail; update from the host. If `GEMINI.md`/`AGENTS.md` are symlinks (e.g. to a dotfiles repository), their targets are read-only and the links are verified and restored on exit (see `protect`).
 
 > [!WARNING]
 > **Agent self-configuration attacks:** Any profile that mounts an agent's configuration directory read-write (e.g. `~/.claude`, `~/.claude.json`, `~/.gemini`) lets the agent, or a prompt injection steering it, rewrite its own configuration. Hooks, MCP servers, plugins, skills and instruction files (`CLAUDE.md`) can all execute commands or alter the agent's behavior, which enables two attack paths:
 > * **Host execution:** if you ever run the agent **outside** the sandbox, a hook or MCP server planted from inside it runs on your host with full user privileges (SSH keys, browser sessions, shell profiles).
 > * **Cross-project persistence:** because the configuration directory is shared, a payload planted while working on project A also runs in later sandboxed sessions for project B, breaking the isolation between workspaces.
 >
-> The same applies to project-level configuration inside the workspace (e.g. `<project>/.claude/settings.json`). Mitigations: run the agent only through the sandbox, review configuration changes periodically (e.g. keep the config directory under Git and inspect `git diff`), mount sensitive files such as `~/.claude/settings.json` read-only (see `profiles.conf`), or point the sandbox at a dedicated configuration directory (e.g. `CLAUDE_CONFIG_DIR`) that is separate from the one your host agent uses.
+> The same applies to project-level configuration inside the workspace (e.g. `<project>/.claude/settings.json`). Mitigations: run the agent only through the sandbox, review configuration changes periodically (e.g. keep the config directory under Git and inspect `git diff`), use the `strict` profile variants (or `protect` directives in your own profiles), or point the sandbox at a dedicated configuration directory (e.g. `CLAUDE_CONFIG_DIR`) that is separate from the one your host agent uses.
 
 ### 4. Run Claude Code with Custom Domain Whitelist
 
@@ -241,7 +267,9 @@ Profiles govern which host paths, IPC mechanisms, and environment variables are 
 | --- | --- | --- | --- |
 | `dev-tools` | `~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `~/.rustup`, `~/.fnm`, `~/.volta`, `~/.bun/bin`, `~/go/bin`, `~/.local/share/mise`, `~/.config/mise`, `~/.local/share/uv` **[RO]** | *(None)* | Exposes host toolchains to compile and test without modifying binaries. |
 | `antigravity` | `~/.antigravity` **[RW]**<br>`~/.gemini` **[RW]**<br>`~/.cache/ms-playwright-go` **[RO]**<br>`xdg-dbus-proxy` socket | `GEMINI_API_KEY`<br>`ANTIGRAVITY_*` | Preserves Antigravity/Gemini state and uses filtered D-Bus for Google OAuth / GNOME Keyring. |
+| `antigravity:strict` | Same as `antigravity`, plus **[RO]**: `~/.gemini/config/` (except `projects/`), `GEMINI.md`, `AGENTS.md`, CLI `settings.json`, `~/.gemini/bin/`, `agentapi` helpers, `~/.antigravity/{extensions,bin}/`, `argv.json` | Same as `antigravity` | Blocks hook, MCP, skill and binary tampering (self-configuration attacks). |
 | `claude` | `~/.claude` **[RW]**<br>`~/.claude.json` **[RW]**<br>`~/.local/state/claude` **[RW]**<br>`~/.local/share/claude` **[RW]**<br>`~/.local/bin/claude` **[RO]**<br>`~/.cache/ms-playwright` **[RO]** | `ANTHROPIC_*`<br>`CLAUDE_CODE_OAUTH_TOKEN` | Preserves Claude Code OAuth credentials, session history and installation. |
+| `claude:strict` | Same as `claude`, plus **[RO]**: `~/.claude/{settings.json,CLAUDE.md}`, `~/.claude/{skills,agents,commands,output-styles,plugins,hooks,chrome}/`, `~/.local/share/claude` | Same as `claude`<br>*(sets `DISABLE_AUTOUPDATER=1`)* | Blocks hook, skill, plugin and binary tampering (self-configuration attacks). |
 | `openai` | *(None)* | `OPENAI_API_KEY` | Forwards OpenAI API credentials to tools that require them. |
 | `deepseek` | *(None)* | `DEEPSEEK_API_KEY` | Forwards DeepSeek API credentials. |
 | `mistral` | *(None)* | `MISTRAL_API_KEY` | Forwards Mistral API credentials. |

@@ -85,6 +85,37 @@ declare -A MOUNT_PERMS=()       # Path -> "ro" | "rw" (Last profile wins)
 ORDERED_MOUNT_PATHS=()          # Preserves registration order
 ENABLE_DBUS_AUTH=false          # Enabled if requested by any active profile (Keyring/Secrets)
 ENABLE_DBUS_NOTIFICATIONS=false # Enabled if requested by any active profile (Desktop notifications)
+declare -A PROTECTED_SYMLINKS=() # Protected symlink path -> original target (verified and restored on exit)
+
+# ------------------------------------------------------------------------------
+# Logging (--log-level error|warn|info|debug, Default: info)
+# Errors are always printed. All log output goes to stderr.
+# ------------------------------------------------------------------------------
+LOG_LEVEL=2 # 0=error 1=warn 2=info 3=debug
+
+# Usage: set_log_level <name> (returns 1 on invalid level)
+set_log_level() {
+    case "$1" in
+        error) LOG_LEVEL=0 ;;
+        warn) LOG_LEVEL=1 ;;
+        info) LOG_LEVEL=2 ;;
+        debug) LOG_LEVEL=3 ;;
+        *) return 1 ;;
+    esac
+}
+
+log_warn() {
+    if [ "$LOG_LEVEL" -ge 1 ]; then echo "Warning: $*" >&2; fi
+}
+
+# Info messages carry their own prefix ('[+]', '[i]')
+log_info() {
+    if [ "$LOG_LEVEL" -ge 2 ]; then echo "$*" >&2; fi
+}
+
+log_debug() {
+    if [ "$LOG_LEVEL" -ge 3 ]; then echo "[debug] $*" >&2; fi
+}
 
 # Cleanup tracker for proxy and sandbox processes
 PROXY_PID=""
@@ -94,6 +125,30 @@ NET_PROXY_DIR=""
 SANDBOX_RUNTIME_DIR=""
 BWRAP_PID=""
 TITLE_RESTORE_NEEDED=false
+
+# Symlinks cannot be mounted read-only (bwrap follows them) and stay replaceable through their
+# writable parent directory, so protected symlinks are verified after the sandbox exits. A replaced
+# entry is preserved as '<path>.sandbox-replaced.<timestamp>' for inspection and the link is restored.
+restore_protected_symlinks() {
+    local link original current backup
+    for link in "${!PROTECTED_SYMLINKS[@]}"; do
+        original="${PROTECTED_SYMLINKS["$link"]}"
+        if [ -L "$link" ] && [ "$(readlink "$link")" = "$original" ]; then
+            log_debug "Protected symlink unchanged: $link -> $original"
+            continue
+        fi
+
+        if [ -e "$link" ] || [ -L "$link" ]; then
+            current="$( [ -L "$link" ] && echo "symlink to '$(readlink "$link")'" || echo "regular $( [ -d "$link" ] && echo directory || echo file)" )"
+            backup="$link.sandbox-replaced.$(date +%Y%m%d-%H%M%S)"
+            mv -- "$link" "$backup"
+            log_warn "Protected symlink '$link' was replaced inside the sandbox ($current). Restored link to '$original'; the replacement was kept at '$backup'."
+        else
+            log_warn "Protected symlink '$link' was removed inside the sandbox. Restored link to '$original'."
+        fi
+        ln -s -- "$original" "$link"
+    done
+}
 
 cleanup() {
     local sig="${1:-0}"
@@ -114,6 +169,9 @@ cleanup() {
         wait "$BWRAP_PID" 2>/dev/null || true
         BWRAP_PID=""
     fi
+
+    # Runs only after the sandbox has exited, so the agent cannot race the restoration
+    restore_protected_symlinks
 
     if [ -n "$PROXY_PID" ]; then
         kill "$PROXY_PID" 2>/dev/null || true
@@ -195,6 +253,45 @@ set_mount() {
     fi
 }
 
+# Usage: protect_path <path>
+# Mounts a path read-only, even when it lives inside a read-write mount (e.g. hooks in ~/.claude).
+# A missing path would otherwise be skipped and could then be created by the agent, so an empty
+# placeholder is created on the host first (directory if the path ends with '/', file otherwise;
+# '{}' for .json files). Placeholders are only created when the parent directory already exists.
+protect_path() {
+    local path="$1"
+    local is_dir=false
+    if [[ "$path" == */ ]]; then
+        is_dir=true
+        path="${path%/}"
+    fi
+
+    # bwrap follows a symlink destination, so the link itself cannot be mounted read-only: its real
+    # target is protected instead and the link is verified (and restored) on exit
+    if [ -L "$path" ]; then
+        local link_target
+        PROTECTED_SYMLINKS["$path"]="$(readlink "$path")"
+        link_target="$(realpath -e "$path" 2>/dev/null || true)"
+        log_debug "Cannot mount symlink '$path' read-only (bwrap follows it); protecting its target '${link_target:-<missing>}' and verifying the link on exit."
+        if [ -n "$link_target" ]; then
+            set_mount "ro" "$link_target"
+        fi
+        return 0
+    fi
+
+    if [ ! -e "$path" ] && [ ! -L "$path" ] && [ -d "$(dirname "$path")" ]; then
+        if [ "$is_dir" = true ]; then
+            mkdir "$path"
+        elif [[ "$path" == *.json ]]; then
+            echo '{}' > "$path"
+        else
+            : > "$path"
+        fi
+        log_info "[+] Created read-only placeholder: $path"
+    fi
+    set_mount "ro" "$path"
+}
+
 # ------------------------------------------------------------------------------
 # Path Expansion Helper
 # ------------------------------------------------------------------------------
@@ -222,22 +319,25 @@ expand_path() {
 ensure_configs() {
     local explicit_init="${1:-false}"
     local created_any=false
+    # Explicit --init reports to stdout; automatic initialization respects the log level
+    local report="log_info"
+    [ "$explicit_init" = true ] && report="echo"
 
     if [ ! -f "$DEFAULT_PROFILES_FILE" ] && [ -f "$PROFILES_EXAMPLE" ]; then
         cp "$PROFILES_EXAMPLE" "$DEFAULT_PROFILES_FILE"
-        echo "[+] Initialized configuration: $DEFAULT_PROFILES_FILE"
+        $report "[+] Initialized configuration: $DEFAULT_PROFILES_FILE"
         created_any=true
     fi
 
     if [ ! -f "$DEFAULT_WHITELIST" ] && [ -f "$WHITELIST_EXAMPLE" ]; then
         cp "$WHITELIST_EXAMPLE" "$DEFAULT_WHITELIST"
-        echo "[+] Initialized whitelist: $DEFAULT_WHITELIST"
+        $report "[+] Initialized whitelist: $DEFAULT_WHITELIST"
         created_any=true
     fi
 
     if [ ! -f "$DEFAULT_SYMLINK_BLOCKLIST" ] && [ -f "$SYMLINK_BLOCKLIST_EXAMPLE" ]; then
         cp "$SYMLINK_BLOCKLIST_EXAMPLE" "$DEFAULT_SYMLINK_BLOCKLIST"
-        echo "[+] Initialized symlink blocklist: $DEFAULT_SYMLINK_BLOCKLIST"
+        $report "[+] Initialized symlink blocklist: $DEFAULT_SYMLINK_BLOCKLIST"
         created_any=true
     fi
 
@@ -280,7 +380,7 @@ load_available_profiles() {
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" || "$line" =~ ^# || "$line" =~ ^\; ]] && continue
 
-        if [[ "$line" =~ ^\[([a-zA-Z0-9_.-]+)\]$ ]]; then
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_.-]+(:[a-zA-Z0-9_.-]+)?)\]$ ]]; then
             current_sec="${BASH_REMATCH[1]}"
             AVAILABLE_PROFILES+=("$current_sec")
             PROFILE_DESCRIPTIONS["$current_sec"]=""
@@ -305,7 +405,7 @@ apply_profile_from_config() {
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" || "$line" =~ ^# || "$line" =~ ^\; ]] && continue
 
-        if [[ "$line" =~ ^\[([a-zA-Z0-9_.-]+)\]$ ]]; then
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_.-]+(:[a-zA-Z0-9_.-]+)?)\]$ ]]; then
             if [ "${BASH_REMATCH[1]}" = "$profile" ]; then
                 in_section=true
             else
@@ -323,12 +423,19 @@ apply_profile_from_config() {
                 raw_path="${raw_path#"${raw_path%%[![:space:]]*}"}"
                 raw_path="${raw_path%"${raw_path##*[![:space:]]}"}"
                 if [ "$mode" != "ro" ] && [ "$mode" != "rw" ]; then
-                    echo "Warning: Invalid mount mode '$mode' in profile '$profile' (expected 'ro' or 'rw'). Skipping." >&2
+                    log_warn "Invalid mount mode '$mode' in profile '$profile' (expected 'ro' or 'rw'). Skipping."
                 else
                     local exp_path
                     exp_path="$(expand_path "$raw_path")"
                     set_mount "$mode" "$exp_path"
                 fi
+            elif [[ "$line" =~ ^protect[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+                local protect_raw="${BASH_REMATCH[1]}"
+                local protect_exp
+                protect_exp="$(expand_path "${protect_raw%/}")"
+                # expand_path drops the trailing slash that marks directory placeholders
+                [[ "$protect_raw" == */ ]] && protect_exp="$protect_exp/"
+                protect_path "$protect_exp"
             elif [[ "$line" =~ ^env[[:space:]]*=[[:space:]]*(.*)$ ]]; then
                 local env_pat="${BASH_REMATCH[1]}"
                 env_pat="${env_pat#"${env_pat%%[![:space:]]*}"}"
@@ -337,7 +444,7 @@ apply_profile_from_config() {
             elif [[ "$line" =~ ^setenv[[:space:]]*=[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
                 SELECTED_SETENV+=("${BASH_REMATCH[1]}=${BASH_REMATCH[2]}")
             elif [[ "$line" =~ ^setenv[[:space:]]*= ]]; then
-                echo "Warning: Invalid setenv directive '$line' in profile '$profile' (expected 'setenv = NAME=VALUE'). Skipping." >&2
+                log_warn "Invalid setenv directive '$line' in profile '$profile' (expected 'setenv = NAME=VALUE'). Skipping."
             elif [[ "$line" =~ ^dbus_auth[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
                 ENABLE_DBUS_AUTH=true
             elif [[ "$line" =~ ^dbus_notifications[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
@@ -406,25 +513,39 @@ apply_profile_fallback() {
     esac
 }
 
+profile_exists() {
+    local p
+    for p in "${AVAILABLE_PROFILES[@]}"; do
+        [ "$p" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# Variants ('base:variant', e.g. 'claude:strict') inherit their base profile: the base is applied
+# first and the variant section is layered on top (last mount registration wins on conflicts).
 apply_profile() {
     local profile="$1"
-    local found=false
-    for p in "${AVAILABLE_PROFILES[@]}"; do
-        if [ "$p" = "$profile" ]; then
-            found=true
-            break
-        fi
-    done
 
-    if [ "$found" = false ]; then
+    if ! profile_exists "$profile"; then
         echo "Error: Unknown profile '$profile'." >&2
         echo "Available profiles: ${AVAILABLE_PROFILES[*]}" >&2
         exit 1
     fi
 
-    if [ -f "$PROFILES_FILE" ]; then
+    if [[ "$profile" == *:* ]]; then
+        local base="${profile%%:*}"
+        if ! profile_exists "$base"; then
+            echo "Error: Profile variant '$profile' requires a base profile section [$base]." >&2
+            exit 1
+        fi
+        log_debug "Applying profile '$profile' (inherits '$base')"
+        apply_profile_from_config "$base" "$PROFILES_FILE"
+        apply_profile_from_config "$profile" "$PROFILES_FILE"
+    elif [ -f "$PROFILES_FILE" ]; then
+        log_debug "Applying profile '$profile'"
         apply_profile_from_config "$profile" "$PROFILES_FILE"
     else
+        log_debug "Applying built-in profile '$profile' (no $(basename "$PROFILES_FILE") found)"
         apply_profile_fallback "$profile"
     fi
 }
@@ -434,13 +555,28 @@ apply_profile() {
 # ------------------------------------------------------------------------------
 list_profiles() {
     echo "Available Agent Profiles (from $(basename "$PROFILES_FILE")):"
+    local p v
     for p in "${AVAILABLE_PROFILES[@]}"; do
-        local desc="${PROFILE_DESCRIPTIONS["$p"]:-No description provided}"
-        printf "  %-14s %s\n" "$p" "$desc"
+        [[ "$p" == *:* ]] && continue
+        printf "  %-14s %s\n" "$p" "${PROFILE_DESCRIPTIONS["$p"]:-No description provided}"
+        # Variants are listed under their base profile
+        for v in "${AVAILABLE_PROFILES[@]}"; do
+            if [[ "$v" == "$p":* ]]; then
+                printf "    %-12s %s\n" ":${v#*:}" "${PROFILE_DESCRIPTIONS["$v"]:-No description provided}"
+            fi
+        done
+    done
+    # Variants whose base section is missing (invalid until the base is defined)
+    for v in "${AVAILABLE_PROFILES[@]}"; do
+        if [[ "$v" == *:* ]] && ! profile_exists "${v%%:*}"; then
+            printf "  %-14s %s\n" "$v" "(Invalid: missing base profile [${v%%:*}])"
+        fi
     done
     cat <<EOF
 
 Note: You can pass multiple profiles (e.g. -p dev-tools -p antigravity).
+      Variants are selected with 'profile:variant' (e.g. -p dev-tools,claude:strict) and
+      inherit their base profile, applying their own directives on top.
       If path permissions conflict, the last profile specified takes precedence.
       Profiles and forwarded environment variables are configured in:
       $PROFILES_FILE
@@ -467,6 +603,7 @@ Options:
                            symlink-blocklist.txt are never mounted)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
+      --log-level LEVEL    Log verbosity: error, warn, info or debug (Default: info; errors are always shown)
   -h, --help               Show this help message
 
 Examples:
@@ -475,6 +612,7 @@ Examples:
   $(basename "$0") -p dev-tools,antigravity -nf -g -- agy
   $(basename "$0") -p dev-tools,antigravity -nf -- agy
   $(basename "$0") -p dev-tools,claude -nf -- claude
+  $(basename "$0") -p dev-tools,claude:strict -nf -- claude
   $(basename "$0") -p dev-tools,claude -nf -w ./my-domains.txt -- claude
   $(basename "$0") -p dev-tools --net -- cargo build
   $(basename "$0") -p dev-tools,claude -nf --resolve-symlinks -- claude
@@ -506,6 +644,23 @@ for ((i=1; i<=$#; i++)); do
             next_idx=$((i + 1))
             if [ $next_idx -le $# ] && [ "${!next_idx}" != "--" ]; then
                 PROFILES_FILE="${!next_idx}"
+            fi
+            ;;
+        # Log level is needed before configuration initialization and profile loading
+        --log-level|--log-level=*)
+            if [ "${!i}" = "--log-level" ]; then
+                next_idx=$((i + 1))
+                level_name="${!next_idx:-}"
+                if [ -z "$level_name" ] || [ "$level_name" = "--" ]; then
+                    echo "Error: Option '--log-level' requires an argument." >&2
+                    exit 1
+                fi
+            else
+                level_name="${!i#*=}"
+            fi
+            if ! set_log_level "$level_name"; then
+                echo "Error: Invalid log level '$level_name' (expected 'error', 'warn', 'info' or 'debug')." >&2
+                exit 1
             fi
             ;;
     esac
@@ -566,6 +721,17 @@ while [[ $# -gt 0 ]]; do
         ;;
     -g | --gui)
         ALLOW_GUI=true
+        shift
+        ;;
+    --log-level)
+        # Already validated and applied by the pre-scan
+        if [[ $# -lt 2 || "$2" == "--" ]]; then
+            echo "Error: Option '$1' requires an argument." >&2
+            exit 1
+        fi
+        shift 2
+        ;;
+    --log-level=*)
         shift
         ;;
     --resolve-symlinks)
@@ -820,8 +986,10 @@ DETECTED_USER_PATHS=()
 for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
     mode="${MOUNT_PERMS["$target_path"]}"
     if is_redundant_file_mount "$target_path"; then
+        log_debug "Skipping redundant mount [$mode] $target_path (covered by a parent directory mount)"
         continue
     fi
+    log_debug "Mount [$mode] $target_path"
     if [ "$mode" = "rw" ]; then
         BWRAP_ARGS+=("--bind" "$target_path" "$target_path")
     elif [ "$mode" = "ro" ]; then
@@ -896,7 +1064,7 @@ load_symlink_blocklist() {
             rw_only=true
             raw_path="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^[a-zA-Z]+: ]]; then
-            echo "Warning: Invalid prefix in symlink blocklist entry '$line' (only 'rw:' is supported). Skipping." >&2
+            log_warn "Invalid prefix in symlink blocklist entry '$line' (only 'rw:' is supported). Skipping."
             continue
         fi
         raw_path="${raw_path#"${raw_path%%[![:space:]]*}"}"
@@ -904,7 +1072,7 @@ load_symlink_blocklist() {
         raw_path="${raw_path//\$SANDBOX_DIR/$SCRIPT_DIR}"
 
         if [[ "$raw_path" != /* && "$raw_path" != "~" && "$raw_path" != "~/"* && "$raw_path" != "\$HOME"* && "$raw_path" != "\${HOME}"* ]]; then
-            echo "Warning: Symlink blocklist entry '$line' is not an absolute path. Skipping." >&2
+            log_warn "Symlink blocklist entry '$line' is not an absolute path. Skipping."
             continue
         fi
         normalize_path "$(expand_path "$raw_path")"
@@ -990,12 +1158,12 @@ if [ -n "$RESOLVE_SYMLINKS" ]; then
         fi
 
         if [ -n "$reason" ]; then
-            echo "Warning: Skipping workspace symlink '$rel_link' -> '$dest': $reason." >&2
+            log_warn "Skipping workspace symlink '$rel_link' -> '$dest': $reason."
             continue
         fi
 
         WORKSPACE_LINK_SOURCES["$dest"]="$src"
-        echo "[+] Resolved workspace symlink '$rel_link' -> '$dest' [$RESOLVE_SYMLINKS]" >&2
+        log_info "[+] Resolved workspace symlink '$rel_link' -> '$dest' [$RESOLVE_SYMLINKS]"
     done < <(find "$TARGET_DIR" -name .git -prune -o -type l -printf '%p\0%l\0' 2>/dev/null || true)
 
     # Mount parents before children, skipping targets already covered by a mounted parent directory
@@ -1205,8 +1373,7 @@ if [ "$ENABLE_DBUS_AUTH" = true ] || [ "$ENABLE_DBUS_NOTIFICATIONS" = true ]; th
                 "--setenv" "DBUS_SESSION_BUS_ADDRESS" "unix:path=/run/user/$USER_UID/bus"
             )
         else
-            echo "Warning: 'xdg-dbus-proxy' is not installed. D-Bus filtering disabled." >&2
-            echo "Run: sudo apt install xdg-dbus-proxy" >&2
+            log_warn "'xdg-dbus-proxy' is not installed. D-Bus filtering disabled (Run: sudo apt install xdg-dbus-proxy)."
         fi
     fi
 fi
@@ -1320,7 +1487,7 @@ if [ "$ALLOW_GUI" = true ]; then
     fi
 
     if [ "$HAS_GUI_DISPLAY" = false ]; then
-        echo "Warning: '--gui' was specified, but no active X11 or Wayland display was detected on the host." >&2
+        log_warn "'--gui' was specified, but no active X11 or Wayland display was detected on the host."
     fi
 fi
 
