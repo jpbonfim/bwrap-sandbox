@@ -127,6 +127,7 @@ NET_PROXY_DIR=""
 SANDBOX_RUNTIME_DIR=""
 BWRAP_PID=""
 TITLE_RESTORE_NEEDED=false
+WORKSPACE_HAD_GIT=""            # "true" | "false" once the workspace is known
 
 # Symlinks cannot be mounted read-only (bwrap follows them) and stay replaceable through their
 # writable parent directory, so protected symlinks are verified after the sandbox exits. A replaced
@@ -152,6 +153,14 @@ restore_protected_symlinks() {
     done
 }
 
+# Only existing repositories get read-only hooks and config, so one created inside the sandbox
+# may already contain hooks or config-defined commands that host-side git would run
+warn_created_git_repository() {
+    if [ "$WORKSPACE_HAD_GIT" = false ] && { [ -e "$TARGET_DIR/.git" ] || [ -L "$TARGET_DIR/.git" ]; }; then
+        log_warn "A Git repository was created inside the sandbox at '$TARGET_DIR/.git'. Its hooks and config were writable by the agent: review '.git/hooks' and '.git/config' before running git on the host."
+    fi
+}
+
 cleanup() {
     local sig="${1:-0}"
     trap - EXIT INT TERM HUP WINCH
@@ -174,6 +183,7 @@ cleanup() {
 
     # Runs only after the sandbox has exited, so the agent cannot race the restoration
     restore_protected_symlinks
+    warn_created_git_repository
 
     if [ -n "$PROXY_PID" ]; then
         kill "$PROXY_PID" 2>/dev/null || true
@@ -1262,16 +1272,105 @@ BWRAP_ARGS+=(
 )
 
 # Edge Case: Prevent Git Hook & Config Poisoning (Workspace Escape Vectors)
-# If .git exists:
-# 1. Make .git/hooks read-only so agent cannot insert malicious hook triggers
-# 2. Make .git/config read-only so agent cannot inject core.fsmonitor, core.hooksPath,
-#    diff.external, core.pager, or credential.helper to achieve host execution upon exiting.
-if [ -d "$TARGET_DIR/.git" ]; then
-    mkdir -p "$TARGET_DIR/.git/hooks"
-    BWRAP_ARGS+=("--ro-bind" "$TARGET_DIR/.git/hooks" "$TARGET_DIR/.git/hooks")
-    if [ -f "$TARGET_DIR/.git/config" ]; then
-        BWRAP_ARGS+=("--ro-bind" "$TARGET_DIR/.git/config" "$TARGET_DIR/.git/config")
+# Git on the host runs hooks and config-defined commands (core.fsmonitor, core.hooksPath,
+# diff.external, core.pager, credential.helper, ...) from the repository metadata, so every
+# entry that decides which hooks and config are used is mounted read-only. The rest of the
+# git directory stays writable, so commits, branches and fetches keep working in the sandbox.
+
+# Usage: git_worktree_config_enabled <common gitdir>
+git_worktree_config_enabled() {
+    command -v git >/dev/null 2>&1 &&
+        [ "$(git config --file "$1/config" --type=bool --get extensions.worktreeConfig 2>/dev/null)" = true ]
+}
+
+# Git reads config and hooks from the directory named in '<gitdir>/commondir' (used by linked
+# worktrees). A repository's own git directory never has one, so the agent could create it to
+# redirect host-side git to a config it controls. A placeholder pointing to the git directory
+# itself ('.') is a no-op for git, and it stays on the host so concurrent sessions in the same
+# repository never remove each other's protection.
+# Usage: ensure_commondir_placeholder <gitdir>
+ensure_commondir_placeholder() {
+    local commondir_file="$1/commondir"
+    if [ ! -e "$commondir_file" ] && [ ! -L "$commondir_file" ]; then
+        echo "." > "$commondir_file"
+        log_debug "Created Git commondir placeholder: $commondir_file"
+    elif [ -L "$commondir_file" ] || [ "$(cat "$commondir_file" 2>/dev/null)" != "." ]; then
+        echo "Security Error: '$commondir_file' redirects Git config and hooks to another directory." >&2
+        echo "A repository's own git directory never contains this file; it may have been planted to run commands on the host." >&2
+        echo "Inspect it and remove it before starting the sandbox." >&2
+        exit 1
     fi
+}
+
+# Usage: protect_git_dir <gitdir> <repository|linked-worktree> <worktree config enabled: true|false>
+protect_git_dir() {
+    local git_dir="$1"
+    local kind="$2"
+    local worktree_config="$3"
+    local name
+
+    # A mount point cannot be renamed or removed, so the protected entries below cannot be
+    # bypassed by replacing the whole directory (paths mounted by a profile already are one)
+    if [ -z "${MOUNT_PERMS["$git_dir"]:-}" ]; then
+        BWRAP_ARGS+=("--bind" "$git_dir" "$git_dir")
+    fi
+
+    if [ "$kind" = "repository" ]; then
+        mkdir -p "$git_dir/hooks"
+        BWRAP_ARGS+=("--ro-bind" "$git_dir/hooks" "$git_dir/hooks")
+        ensure_commondir_placeholder "$git_dir"
+    fi
+    # config.worktree is only read when extensions.worktreeConfig is enabled (in the read-only config)
+    if [ "$worktree_config" = true ] && [ ! -e "$git_dir/config.worktree" ]; then
+        : > "$git_dir/config.worktree"
+    fi
+
+    for name in config config.worktree commondir gitdir; do
+        if [ -f "$git_dir/$name" ]; then
+            BWRAP_ARGS+=("--ro-bind" "$git_dir/$name" "$git_dir/$name")
+        fi
+    done
+}
+
+# Protects a common git directory and the git directories of its linked worktrees (worktrees/*)
+# Usage: protect_git_common_dir <common gitdir>
+protect_git_common_dir() {
+    local common_dir="$1"
+    local worktree_config=false
+    local worktree_dir
+    git_worktree_config_enabled "$common_dir" && worktree_config=true
+
+    protect_git_dir "$common_dir" "repository" "$worktree_config"
+    for worktree_dir in "$common_dir"/worktrees/*/; do
+        if [ -d "$worktree_dir" ]; then
+            protect_git_dir "${worktree_dir%/}" "linked-worktree" "$worktree_config"
+        fi
+    done
+}
+
+# Protects a repository and its submodules, including nested ones (modules/**, whose git
+# directories are identified by their HEAD, config and objects)
+# Usage: protect_git_repository <common gitdir>
+protect_git_repository() {
+    local common_dir="$1"
+    local module_dir
+    protect_git_common_dir "$common_dir"
+
+    [ -d "$common_dir/modules" ] || return 0
+    while IFS= read -r -d '' module_dir; do
+        if [ -f "$module_dir/config" ] && [ -d "$module_dir/objects" ]; then
+            protect_git_common_dir "$module_dir"
+        fi
+    done < <(find "$common_dir/modules" -mindepth 2 -type f -name HEAD -printf '%h\0' 2>/dev/null | sort -zu)
+}
+
+WORKSPACE_HAD_GIT=false
+if [ -e "$TARGET_DIR/.git" ] || [ -L "$TARGET_DIR/.git" ]; then
+    WORKSPACE_HAD_GIT=true
+fi
+
+if [ -d "$TARGET_DIR/.git" ]; then
+    protect_git_repository "$TARGET_DIR/.git"
 elif [ -f "$TARGET_DIR/.git" ]; then
     # Git worktree or submodule pointer file
     BWRAP_ARGS+=("--ro-bind" "$TARGET_DIR/.git" "$TARGET_DIR/.git")
@@ -1307,34 +1406,15 @@ elif [ -f "$TARGET_DIR/.git" ]; then
                 fi
             fi
 
-            # Mount common gitdir (stores objects, refs, packed-refs, etc.)
+            # Mount and protect the common gitdir (objects, refs, packed-refs, etc.) and the
+            # worktree-specific gitdir, which usually lives in its 'worktrees/' directory
             if [ -d "$COMMON_GITDIR" ]; then
-                if [ -z "${MOUNT_PERMS["$COMMON_GITDIR"]:-}" ]; then
-                    BWRAP_ARGS+=("--bind" "$COMMON_GITDIR" "$COMMON_GITDIR")
-                fi
-                # Defend git hooks & config in common gitdir against agent poisoning
-                mkdir -p "$COMMON_GITDIR/hooks"
-                BWRAP_ARGS+=("--ro-bind" "$COMMON_GITDIR/hooks" "$COMMON_GITDIR/hooks")
-                if [ -f "$COMMON_GITDIR/config" ]; then
-                    BWRAP_ARGS+=("--ro-bind" "$COMMON_GITDIR/config" "$COMMON_GITDIR/config")
-                fi
+                protect_git_repository "$COMMON_GITDIR"
             fi
-
-            # Mount worktree-specific gitdir if distinct from common gitdir
-            if [ "$WT_GITDIR" != "$COMMON_GITDIR" ]; then
-                if [[ "$WT_GITDIR" != "$COMMON_GITDIR"/* ]] && [ -d "$WT_GITDIR" ]; then
-                    BWRAP_ARGS+=("--bind" "$WT_GITDIR" "$WT_GITDIR")
-                fi
-                # Defend pointer files and worktree config
-                if [ -f "$WT_GITDIR/commondir" ]; then
-                    BWRAP_ARGS+=("--ro-bind" "$WT_GITDIR/commondir" "$WT_GITDIR/commondir")
-                fi
-                if [ -f "$WT_GITDIR/gitdir" ]; then
-                    BWRAP_ARGS+=("--ro-bind" "$WT_GITDIR/gitdir" "$WT_GITDIR/gitdir")
-                fi
-                if [ -f "$WT_GITDIR/config.worktree" ]; then
-                    BWRAP_ARGS+=("--ro-bind" "$WT_GITDIR/config.worktree" "$WT_GITDIR/config.worktree")
-                fi
+            if [ "$WT_GITDIR" != "$COMMON_GITDIR" ] && [[ "$WT_GITDIR" != "$COMMON_GITDIR"/worktrees/* ]]; then
+                worktree_config=false
+                git_worktree_config_enabled "$COMMON_GITDIR" && worktree_config=true
+                protect_git_dir "$WT_GITDIR" "linked-worktree" "$worktree_config"
             fi
         fi
     fi
