@@ -305,28 +305,24 @@ A host variable reaches the sandbox only if an `env` directive in an active prof
 
 ## How it works
 
-* **Filtered network (`-nf`):** the sandbox keeps its own network namespace (`--unshare-net`), with no routes out. Inside, a relay on `127.0.0.1:18080` (socat or Python) forwards to a Unix socket mounted from the host, where `net-proxy.py` checks each request against `allowed-domains.txt`. `HTTP_PROXY`/`HTTPS_PROXY` point at the relay, so no port is opened on the host:
+Each run turns the selected profiles and flags into a `bwrap` command, starts the helper proxies it needs on the host, and runs the command in new namespaces. Everything is removed when the command exits.
 
-  ```
-  sandbox (own netns, no routes)              host
-    app ──HTTP_PROXY──▶ 127.0.0.1:18080
-                        relay (socat/python) ──unix socket──▶ net-proxy.py ──▶ allowed domains
-                                                                └─ 403 for everything else
-  ```
+```
+host                                          sandbox
+/usr, parts of /etc  ─────────── ro ────────▶ same paths
+profile mounts       ──── ro / rw / tmpfs ──▶ same paths
+project directory    ─────────── rw ────────▶ same path (Git hooks and config ro)
+                                tmpfs ──────▶ $HOME, /tmp
+session D-Bus ──▶ xdg-dbus-proxy ───────────▶ keyring / notifications only
+allowed domains ◀── net-proxy.py ◀── unix socket ◀── relay on 127.0.0.1:18080 ◀── app
+```
 
-  Domains or ports not on the list get `403 Forbidden`, and direct TCP/UDP connections fail with `Network is unreachable`. Host services are reachable only when listed explicitly, e.g. `localhost:11434` for Ollama, `127.0.0.1:8000,8080`, or ranges such as `3000-3010`.
-
-  The proxy only sees the host and port the client asks for. Traffic inside an allowed `CONNECT` tunnel (TLS SNI, the inner `Host` header, any protocol on an allowed port) is not inspected, so a whitelisted CDN or shared hosting platform can relay requests to other sites it serves (domain fronting). On shared platforms, list specific hostnames rather than wildcards. Request heads must arrive within 30 seconds and have at most 100 header lines; upstream connections time out after 15 seconds; established tunnels have no idle timeout.
-* **Git SSH remotes under `-nf`:** SSH (port 22) cannot go through an HTTP proxy, so with `-nf` `GIT_CONFIG_PARAMETERS` rewrites `git@github.com:` and `git@gitlab.com:` to `https://`, and `git clone`/`git fetch` go through the proxy.
-* **Git metadata:** Git on the host runs hooks and commands taken from config (`core.fsmonitor`, `core.pager`, `diff.external`, `credential.helper`, ...), so a poisoned repository would run code outside the sandbox the next time you type `git status`. For the workspace repository, its linked worktrees (`.git/worktrees/*`) and its submodules (`.git/modules/**`), the files `hooks/`, `config`, `config.worktree`, `commondir` and `gitdir` are mounted read-only, and every git directory is mounted onto itself so it cannot be renamed or replaced. Objects, refs, the index and logs stay writable, so the agent can commit, branch and fetch. Since `<gitdir>/commondir` could redirect Git to config and hooks elsewhere, a harmless placeholder containing `./` is created in each repository and left there (Git only reports the common directory as an absolute path, e.g. in `git rev-parse --git-common-dir`); if an existing `commondir` points anywhere else, the sandbox refuses to start. Not covered: a repository the agent initializes during the session (a warning is shown on exit) and nested repositories it creates inside the workspace, so only run Git on the host in directories you expect to be repositories.
-* **D-Bus:** handing the raw session bus to a sandbox lets it ask `systemd --user` to run commands outside every namespace. Profiles that need D-Bus get their own `xdg-dbus-proxy` that allows only the requested names:
-  * `dbus_auth = true` exposes `org.freedesktop.secrets` and `org.gnome.keyring`. Anything in the sandbox can then read unlocked keyring secrets, so enable it only where host keyring integration is required.
-  * `dbus_notifications = true` exposes `org.freedesktop.Notifications`, with no keyring access.
-* **Nested user namespaces (`--disable-userns`):** blocked unless `--allow-userns` or `allow_userns = true` is used. This keeps netfilter, mounts and other kernel interfaces that user namespaces open to unprivileged users out of reach.
-* **Environment:** `--clearenv` removes every host variable; locale, terminal and proxy variables are set explicitly, and the rest comes only from the active profiles' `env` and `setenv` directives (see [Environment variables](#environment-variables)).
-* **Profile symlinks:** symlinks inside profile mounts that point elsewhere (e.g. `~/.claude/settings.json -> ~/dotfiles/claude/settings.json`) have their targets mounted read-only so they keep working. Since an agent could plant such a link in a writable mount (e.g. `~/.claude/x -> ~`) to get it mounted in a later session, targets go through the same rules as `--resolve-symlinks`: blocklisted paths, directories containing them or the workspace, and targets containing sockets, devices or FIFOs are refused with a warning (and none are resolved if `symlink-blocklist.txt` is missing). Paths named directly in `mount` entries are trusted. `--log-level debug` lists every resolved target.
-* **Process lifetime:** `--die-with-parent` kills everything in the sandbox if the script exits. On exit, a `trap` stops `xdg-dbus-proxy` and `net-proxy.py` and removes the temporary directories (`/tmp/bwrap-rt-*`, `/tmp/bwrap-dbus-*`, `/tmp/bwrap-net-*`).
-* **usr-merge:** `/bin`, `/sbin`, `/lib` and `/lib64` are recreated as symlinks when they are symlinks on the host, so the sandbox works on both merged and split layouts.
+* **Filesystem:** only the paths above exist. Symlinks inside profile mounts are resolved under the same blocklist as `--resolve-symlinks`.
+* **Network:** none by default. With `-nf`, `HTTP_PROXY` points to the in-sandbox relay, the host-side proxy allows only the `host:port` pairs in `allowed-domains.txt`, and any other connection fails. Tunnels to allowed hosts are not inspected, so list specific hostnames instead of wildcards on shared platforms. `--net` shares the host network instead.
+* **Git:** hooks, `config`, `commondir` and `gitdir` of the repository, its worktrees and submodules are read-only; objects, refs and the index stay writable. A `commondir` placeholder containing `./` is left in each repository. With `-nf`, GitHub and GitLab SSH remotes are rewritten to HTTPS. Repositories created during the session are not protected.
+* **D-Bus:** a single `xdg-dbus-proxy` exposes only the services enabled by the profiles; `systemd --user` and everything else on the bus stay unreachable.
+* **Processes:** private PID namespace, new session (no `TIOCSTI`), no nested user namespaces (unless `--allow-userns`), and everything is killed when the script exits.
+* **Environment:** starts empty (`--clearenv`); only locale, terminal, proxy and profile variables are set.
 
 ---
 
