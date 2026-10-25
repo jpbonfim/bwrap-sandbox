@@ -343,6 +343,11 @@ expand_path() {
     printf "%s\n" "$p"
 }
 
+# Usage: path_within <parent> <path> (true if path is parent or lies inside it)
+path_within() {
+    [ "$1" = "/" ] || [ "$2" = "$1" ] || [[ "$2" == "$1"/* ]]
+}
+
 # ------------------------------------------------------------------------------
 # Configuration Initialization & Profile Discovery (100% Native Bash)
 # ------------------------------------------------------------------------------
@@ -865,15 +870,36 @@ fi
 # Resolve absolute path for workspace
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd -P)"
 
-# Guard: Prevent running directly on sensitive system directories or $HOME
-case "$TARGET_DIR" in
-    /|/etc|/etc/*|/usr|/usr/*|/bin|/sbin|/lib*|/boot|/boot/*|/sys|/sys/*|/proc|/proc/*|/dev|/dev/*|/var|/root|"$HOME")
-        echo "Security Error: Running sandbox on system directory or HOME ('$TARGET_DIR') is strictly forbidden." >&2
-        echo "This would expose your host system or credentials to the sandbox." >&2
-        echo "Please specify a dedicated project workspace directory via '-d PATH' or run from within a subfolder." >&2
-        exit 1
-        ;;
-esac
+# Guard: Prevent running directly on sensitive system directories, shared roots or $HOME
+# Usage: is_forbidden_workspace <canonical path>
+# Any directory containing $HOME (e.g. /home) would expose credentials read-write, runtime and
+# temporary roots hold host IPC sockets, and mount roots hold other drives or users' data.
+is_forbidden_workspace() {
+    local dir="$1"
+    local home
+    for home in "$HOME" "$(realpath -m "$HOME")"; do
+        if path_within "$dir" "$home"; then
+            return 0
+        fi
+    done
+    case "$dir" in
+        /etc|/etc/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib*|/boot|/boot/*|/sys|/sys/*|/proc|/proc/*|/dev|/dev/*|/root|/root/*|\
+        /run|/run/*|/var|/var/run|/var/run/*|/var/lib|/var/lib/*|/var/log|/var/log/*|/var/tmp|/tmp|/mnt|/media|/opt|/srv)
+            return 0
+            ;;
+        "/media/${USER:-}")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+if is_forbidden_workspace "$TARGET_DIR"; then
+    echo "Security Error: Running sandbox on a system directory, shared root or a directory containing HOME ('$TARGET_DIR') is strictly forbidden." >&2
+    echo "This would expose your host system or credentials to the sandbox." >&2
+    echo "Please specify a dedicated project workspace directory via '-d PATH' or run from within a subfolder." >&2
+    exit 1
+fi
 
 # Default to user's shell or bash if no command specified
 if [ ${#COMMAND[@]} -eq 0 ]; then
@@ -986,11 +1012,6 @@ fi
 # sessions) or shipped by a cloned repository, so their targets are checked against
 # symlink-blocklist.txt and refused when they expose host IPC endpoints or devices.
 # ------------------------------------------------------------------------------
-# Usage: path_within <parent> <path> (true if path is parent or lies inside it)
-path_within() {
-    [ "$1" = "/" ] || [ "$2" = "$1" ] || [[ "$2" == "$1"/* ]]
-}
-
 # Lexically normalizes an absolute path (resolves '.' and '..' without following symlinks)
 # into NORMALIZED_PATH, avoiding a subprocess per symlink on large workspaces.
 normalize_path() {
