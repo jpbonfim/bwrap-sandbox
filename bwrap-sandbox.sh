@@ -383,7 +383,7 @@ load_available_profiles() {
     if [ ! -f "$file" ]; then
         AVAILABLE_PROFILES=("dev-tools" "antigravity" "claude" "openai" "deepseek" "mistral" "groq" "none")
         PROFILE_DESCRIPTIONS["dev-tools"]="Mounts host user toolchains (~/.cargo/bin, ~/.nvm, ~/.pyenv, mise, etc.) [Read-Only]"
-        PROFILE_DESCRIPTIONS["antigravity"]="Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache and Google Chrome [RO], and filters D-Bus Keyring/Notifications"
+        PROFILE_DESCRIPTIONS["antigravity"]="Mounts ~/.antigravity, ~/.antigravity-ide, ~/.gemini, configs and caches [RW], agy binary, Chrome and Playwright [RO], and filters D-Bus Keyring/Notifications"
         PROFILE_DESCRIPTIONS["claude"]="Mounts ~/.claude, ~/.claude.json and Claude Code installation [RW], Playwright cache and Google Chrome [RO]"
         PROFILE_DESCRIPTIONS["openai"]="Forwards OpenAI API credentials"
         PROFILE_DESCRIPTIONS["deepseek"]="Forwards DeepSeek API credentials"
@@ -505,12 +505,18 @@ apply_profile_fallback() {
             ;;
         antigravity)
             set_mount "rw" "$HOME/.antigravity"
+            set_mount "rw" "$HOME/.antigravity-ide"
             set_mount "rw" "$HOME/.gemini"
+            set_mount "rw" "$HOME/.config/antigravity"
+            set_mount "rw" "$HOME/.config/Antigravity"
+            set_mount "rw" "$HOME/.config/Antigravity IDE"
+            set_mount "rw" "$HOME/.cache/antigravity"
+            set_mount "ro" "$HOME/.local/bin/agy"
             set_mount "ro" "$HOME/.cache/ms-playwright-go"
             set_mount "ro" "$HOME/.cache/ms-playwright"
             mount_tmpfs "$HOME/.cache/ms-playwright/b"
             set_mount "ro" "/opt/google/chrome"
-            SELECTED_ENV_PATTERNS+=("GEMINI_API_KEY" "ANTIGRAVITY_*")
+            SELECTED_ENV_PATTERNS+=("GEMINI_*" "ANTIGRAVITY_*" "GOOGLE_API_KEY" "GOOGLE_APPLICATION_CREDENTIALS")
             ENABLE_DBUS_AUTH=true
             ENABLE_DBUS_NOTIFICATIONS=true
             ;;

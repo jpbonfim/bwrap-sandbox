@@ -49,6 +49,10 @@
 ~/.claude.json
 ~/.gemini
 ~/.antigravity
+~/.antigravity-ide
+~/.config/antigravity
+~/.config/Antigravity
+~/.config/Antigravity IDE
 
 # ------------------------------------------------------------------------------
 # 3. Browser Profiles (Cookies & Sessions)
