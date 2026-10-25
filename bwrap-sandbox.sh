@@ -1691,7 +1691,8 @@ if [ "$ALLOW_NET_FILTERED" = true ]; then
     # If the user explicitly declared localhost/127.0.0.1 rules in the whitelist,
     # do NOT bypass the proxy for localhost so traffic reaches the filtering proxy!
     if [ -f "$WHITELIST_FILE" ]; then
-        if grep -Eq '^[[:space:]]*(\*\.)?(localhost|127\.0\.0\.1|::1)' "$WHITELIST_FILE"; then
+        # The host must end right after the name, so e.g. 'localhost.example.com' does not count
+        if grep -Eiq '^[[:space:]]*(https?://)?(\*\.)?(localhost|127\.0\.0\.1|\[?::1\]?)([:/[:space:]]|$)' "$WHITELIST_FILE"; then
             SANDBOX_NO_PROXY=""
         fi
     fi
