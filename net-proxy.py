@@ -368,6 +368,10 @@ class FilteringProxyServer:
                     proto = parts[2] if len(parts) > 2 else "HTTP/1.1"
                     headers[0] = f"{method} {path} {proto}\r\n".encode("utf-8")
 
+                # The client's Host header was dropped while reading: send the authority that passed
+                # the whitelist check (RFC 9112 requires proxies to replace it with the absolute URI's)
+                headers.insert(1, f"Host: {target_spec}\r\n".encode("utf-8"))
+
                 # Force Connection: close to prevent lingering keep-alive sockets in plain HTTP
                 headers.append(b"Connection: close\r\n\r\n")
 
