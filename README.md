@@ -91,10 +91,15 @@ Supported directives:
 * `description = <text>`: Summary shown in `--list-profiles`.
 * `mount = <ro|rw>:<path>`: Directory or file to bind-mount. Supports `~` and `$HOME` expansion. Repeatable.
 * `protect = <path>[/]`: Mounts a path read-only, even inside a read-write mount (e.g. `~/.claude/settings.json` inside `~/.claude`). Since a missing path could otherwise be created by the agent, an empty placeholder is created on the host first (a directory when the path ends with `/`, otherwise a file, `{}` for `.json`), only if its parent directory exists. Protected paths cannot be modified, renamed or replaced. Symlinks (e.g. files managed by a dotfiles repository) cannot be mounted read-only because bwrap follows them, and the link itself stays replaceable through its writable parent directory: their real target is protected instead, and after the sandbox exits the link is verified. If it was replaced or removed, the link is restored and any replacement is kept as `<path>.sandbox-replaced.<timestamp>` for inspection (a warning is shown). Repeatable.
+* `tmpfs = <path>`: Mounts an empty, writable tmpfs over a directory, typically inside a read-only mount (e.g. `~/.cache/ms-playwright/b`, the registry where `@playwright/mcp` records running browsers). Writes stay in the sandbox's RAM and are discarded on exit, so nothing written there is ever read by tools on the host. A missing directory is created on the host first (only if its parent exists), since bwrap cannot create a mount point inside a read-only mount. Repeatable.
 * `env = <NAME|PATTERN_*>`: Environment variable(s) to forward from the host. Supports wildcards (e.g., `ANTIGRAVITY_*`). Repeatable.
 * `setenv = <NAME>=<VALUE>`: Fixed environment variable set inside the sandbox regardless of the host environment (e.g., `DISABLE_AUTOUPDATER=1`). Repeatable.
 * `dbus_auth = true|false`: Enables filtered D-Bus proxy access to Secret Service / Keyring tokens (`org.freedesktop.secrets`, `org.gnome.keyring`).
 * `dbus_notifications = true|false`: Enables filtered D-Bus proxy access to desktop notifications (`org.freedesktop.Notifications`).
+* `gui = true|false`: Exposes the host X11/Wayland display and clipboard, same as `--gui`.
+* `allow_userns = true|false`: Allows processes inside the sandbox to create nested user namespaces, same as `--allow-userns` (see the security warning below).
+
+The `dbus_*`, `gui` and `allow_userns` switches are enabled as soon as any active profile sets them to `true`; `false` (or omitting them) never disables a switch enabled by another profile or by a command-line flag.
 
 **Example custom profile:**
 ```ini
@@ -126,7 +131,7 @@ mount = ro:~/.cache/huggingface
 ./bwrap-sandbox.sh -p dev-tools,my-agent:strict -nf -- my-agent-cli
 ```
 
-The default template ships `standard` (identical to the base profile, so `-p claude` and `-p claude:standard` are equivalent) and `strict` variants for `claude` and `antigravity`. The `:` separator needs no shell quoting, unlike brackets, which zsh treats as glob patterns.
+The default template ships `standard` and `strict` variants for `claude` and `antigravity`. The `standard` variants additionally enable `gui` and `allow_userns` for headed browsers (see [Security Implications of `--gui`](#security-implications-of---gui) and [Security Implications of `--allow-userns`](#security-implications-of---allow-userns)), so `-p claude` and `-p claude:standard` are **not** equivalent. The `:` separator needs no shell quoting, unlike brackets, which zsh treats as glob patterns.
 
 ---
 
@@ -145,6 +150,8 @@ Options:
   -n, --net                Allow unrestricted network access (Default: OFF / isolated)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
   -g, --gui                Expose X11/Wayland display and clipboard (Warning: reduces isolation)
+      --allow-userns       Allow nested user namespaces, e.g. for Chrome's own sandbox
+                           (Warning: exposes more kernel attack surface)
       --resolve-symlinks[=ro|rw]
                            Mount targets of workspace symlinks pointing outside the project
                            ('read'/'write' are aliases; Default: ro; paths listed in
@@ -160,10 +167,23 @@ The `--` delimiter separates script options from the command passed to the sandb
 Use `--log-level debug` to inspect which profiles were applied and every mount with its `ro`/`rw` mode, or `--log-level warn`/`error` to silence informational reports.
 
 > [!WARNING]
-> **Security Implications of `--gui`:**
-> Enabling GUI access (`-g, --gui`) forwards your host's X11 and/or Wayland display server and clipboard into the sandbox. This enables pasting images from the clipboard into terminal agents (e.g., `agy`), running headed browsers (`headless: false` in Playwright), and viewing graphical plots.
+> #### Security Implications of `--gui`
+> Enabling GUI access (`-g, --gui`, or `gui = true` in a profile) forwards your host's X11 and/or Wayland display server and clipboard into the sandbox. This enables pasting images from the clipboard into terminal agents (e.g., `agy`), running headed browsers (`headless: false` in Playwright), and viewing graphical plots.
 >
-> However, **the legacy X11 protocol does not isolate clients**. On native X11 desktops, any process inside the sandbox could theoretically monitor host keystrokes (keylogging), capture screenshots of other windows, or inject synthetic input events into host terminals. Wayland provides strong per-client isolation and prevents these cross-client attacks. Only enable `--gui` when you explicitly require graphical or clipboard capabilities.
+> * **X11 does not isolate clients.** Any process inside the sandbox can log keystrokes sent to other X11 windows, capture their contents and inject synthetic input into them (XTest). If a host terminal runs under X11, injected keystrokes execute commands **outside the sandbox**, which amounts to a full sandbox escape. On a Wayland session the X11 socket belongs to Xwayland, so only applications running through Xwayland are exposed (list them with `xlsclients` on the host); native Wayland applications stay isolated.
+> * **Wayland isolates clients** from each other's input and screen contents. Screen capture requires the desktop portal, which the filtered D-Bus proxy does not expose.
+> * **Both protocols share the clipboard.** A sandboxed process can replace what you copied with a malicious command that runs when you paste it into a host terminal (clipboard poisoning), and it can read clipboard contents when it has focus.
+> * **Both protocols allow spoofed windows.** The sandbox can open a window imitating a password, keyring or sudo prompt and capture what you type into it.
+>
+> Only enable `--gui` when you explicitly require graphical or clipboard capabilities (headless browsers do not need it), and check pasted commands before running them in a host terminal.
+
+> [!WARNING]
+> #### Security Implications of `--allow-userns`
+> By default the sandbox passes `--disable-userns` to bwrap, so processes inside it cannot create nested user namespaces. `--allow-userns` (or `allow_userns = true` in a profile) lifts this restriction, which is required by software that builds its own sandbox, such as Chrome/Chromium (otherwise it must run with `--no-sandbox`).
+>
+> Creating a namespace does not by itself escape bwrap: nested namespaces stay confined to the sandbox. The risk is that an unprivileged user namespace grants capabilities (e.g. `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) over kernel subsystems normally reserved for root, such as netfilter/nf_tables, mounts and some filesystems. Many Linux local privilege escalation exploits (e.g. CVE-2024-1086 in nf_tables) are reachable only through this path. With nested user namespaces allowed, **any code running in the sandbox, including commands an agent runs because of a prompt injection, can reach that attack surface, and a working kernel exploit escapes the sandbox entirely and gains root on the host**.
+>
+> Trade-off for headed browsers: keeping `--disable-userns` and running the browser with `--no-sandbox` (e.g. `@playwright/mcp --no-sandbox`) exposes only what the bwrap sandbox already exposes to a compromised page, while `--allow-userns` keeps the browser's sandbox but weakens the outer boundary. Prefer `--no-sandbox` when the browser only visits trusted sites, keep the host kernel up to date, and enable `--allow-userns` only for sessions that need it. On Ubuntu, AppArmor (`kernel.apparmor_restrict_unprivileged_userns`) may still block nested namespaces.
 
 ---
 
@@ -199,6 +219,7 @@ Run Claude Code with host toolchains, persistent sessions/credentials, and netwo
 ```
 
 Notes for the `claude` profile:
+* **Headed browsers (`claude:standard`):** The `standard` variant enables `gui` and `allow_userns`, so Playwright can open a visible Chrome window with Chrome's own sandbox. Use the base `claude` profile when you don't need a browser, to keep `--disable-userns` and the display closed.
 * **Notifications:** The profile enables `dbus_notifications`, so hooks can send desktop notifications (e.g. `notify-send` from a `Stop` hook). Only `org.freedesktop.Notifications` is reachable through the filtered D-Bus proxy; keyring and systemd access stay blocked.
 * **Authentication:** On Linux, Claude Code stores OAuth credentials in `~/.claude/.credentials.json`, which is shared with the host, so no keyring/D-Bus access is required. If you are already logged in on the host, the sandbox reuses that session (token refreshes go through `platform.claude.com`, included in the default whitelist). To log in from inside the sandbox, run `/login`: the browser cannot be launched from the sandbox, so open the printed URL on the host and paste the authorization code back into the terminal. API key users can export `ANTHROPIC_API_KEY` instead (all `ANTHROPIC_*` variables and `CLAUDE_CODE_OAUTH_TOKEN` are forwarded).
 * **Updates:** The Claude Code installation (`~/.local/share/claude`) is mounted read-write for convenience, so Claude Code can update itself. This also means the agent can modify the executable you run on the host. The `strict` variant mounts it read-only and disables auto-updates (`DISABLE_AUTOUPDATER=1`); run `claude update` on the host instead.
@@ -267,9 +288,11 @@ Profiles govern which host paths, IPC mechanisms, and environment variables are 
 | Profile | Mounts / Permissions | Forwarded Environment Variables | Purpose |
 | --- | --- | --- | --- |
 | `dev-tools` | `~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `~/.rustup`, `~/.fnm`, `~/.volta`, `~/.bun/bin`, `~/go/bin`, `~/.local/share/mise`, `~/.config/mise`, `~/.local/share/uv` **[RO]** | *(None)* | Exposes host toolchains to compile and test without modifying binaries. |
-| `antigravity` | `~/.antigravity` **[RW]**<br>`~/.gemini` **[RW]**<br>`~/.cache/ms-playwright-go` **[RO]**<br>`xdg-dbus-proxy` socket | `GEMINI_API_KEY`<br>`ANTIGRAVITY_*` | Preserves Antigravity/Gemini state and uses filtered D-Bus for Google OAuth / GNOME Keyring. |
+| `antigravity` | `~/.antigravity` **[RW]**<br>`~/.gemini` **[RW]**<br>`~/.cache/ms-playwright-go` **[RO]**<br>`~/.cache/ms-playwright` **[RO]**<br>`~/.cache/ms-playwright/b` **[tmpfs]**<br>`/opt/google/chrome` **[RO]**<br>`xdg-dbus-proxy` socket | `GEMINI_API_KEY`<br>`ANTIGRAVITY_*` | Preserves Antigravity/Gemini state and uses filtered D-Bus for Google OAuth / GNOME Keyring. |
+| `antigravity:standard` | Same as `antigravity`, plus X11/Wayland display and clipboard (`gui`) and nested user namespaces (`allow_userns`) | Same as `antigravity` | Headed browsers (Playwright `headless: false`) with Chrome's own sandbox. Weakens isolation (see `--gui` and `--allow-userns`). |
 | `antigravity:strict` | Same as `antigravity`, plus **[RO]**: `~/.gemini/config/` (except `projects/`), `GEMINI.md`, `AGENTS.md`, CLI `settings.json`, `~/.gemini/bin/`, `agentapi` helpers, `~/.antigravity/{extensions,bin}/`, `argv.json` | Same as `antigravity` | Blocks hook, MCP, skill and binary tampering (self-configuration attacks). |
-| `claude` | `~/.claude` **[RW]**<br>`~/.claude.json` **[RW]**<br>`~/.local/state/claude` **[RW]**<br>`~/.local/share/claude` **[RW]**<br>`~/.local/bin/claude` **[RO]**<br>`~/.cache/ms-playwright` **[RO]**<br>`xdg-dbus-proxy` socket (notifications only) | `ANTHROPIC_*`<br>`CLAUDE_CODE_OAUTH_TOKEN` | Preserves Claude Code OAuth credentials, session history and installation; allows desktop notifications from hooks. |
+| `claude` | `~/.claude` **[RW]**<br>`~/.claude.json` **[RW]**<br>`~/.local/state/claude` **[RW]**<br>`~/.local/share/claude` **[RW]**<br>`~/.local/bin/claude` **[RO]**<br>`~/.cache/ms-playwright` **[RO]**<br>`~/.cache/ms-playwright/b` **[tmpfs]**<br>`/opt/google/chrome` **[RO]**<br>`xdg-dbus-proxy` socket (notifications only) | `ANTHROPIC_*`<br>`CLAUDE_CODE_OAUTH_TOKEN` | Preserves Claude Code OAuth credentials, session history and installation; allows desktop notifications from hooks. |
+| `claude:standard` | Same as `claude`, plus X11/Wayland display and clipboard (`gui`) and nested user namespaces (`allow_userns`) | Same as `claude` | Headed browsers (Playwright `headless: false`) with Chrome's own sandbox. Weakens isolation (see `--gui` and `--allow-userns`). |
 | `claude:strict` | Same as `claude`, plus **[RO]**: `~/.claude/{settings.json,CLAUDE.md}`, `~/.claude/{skills,agents,commands,output-styles,plugins,hooks,chrome}/`, `~/.local/share/claude` | Same as `claude`<br>*(sets `DISABLE_AUTOUPDATER=1`)* | Blocks hook, skill, plugin and binary tampering (self-configuration attacks). |
 | `openai` | *(None)* | `OPENAI_API_KEY` | Forwards OpenAI API credentials to tools that require them. |
 | `deepseek` | *(None)* | `DEEPSEEK_API_KEY` | Forwards DeepSeek API credentials. |
@@ -338,6 +361,7 @@ Inspect current profiles and descriptions:
 * **D-Bus Host Escape Neutralization & Fine-Grained Permissions:** Passing raw host D-Bus sockets into a sandbox allows attackers to instruct `systemd --user` to run commands outside all namespaces. Profiles requiring D-Bus spawn an isolated `xdg-dbus-proxy` filtering out all calls except explicitly permitted bus names, while completely blocking `org.freedesktop.systemd1` and other host APIs. Permissions are decoupled for least privilege:
   * `dbus_auth = true`: Filters and exposes `org.freedesktop.secrets` and `org.gnome.keyring` (used for OAuth tokens). *(Note: Allows processes inside the sandbox to query unlocked keyring credentials, so only enable it on profiles that strictly require host keyring integration).*
   * `dbus_notifications = true`: Filters and exposes `org.freedesktop.Notifications`, allowing desktop notifications (e.g. `notify-send`) without granting any credential or keyring access.
+* **Nested User Namespace Blocking (`--disable-userns`):** Processes inside the sandbox cannot create further user namespaces, closing off the kernel attack surface (netfilter, mounts, etc.) that unprivileged user namespaces expose to local privilege escalation exploits. Lifted only by `--allow-userns` or `allow_userns = true`.
 * **Process Termination Assurance (`--die-with-parent`):** If the parent shell or terminal terminates, the Linux kernel terminates every subprocess inside the sandbox namespace.
 * **Automatic Resource Cleanup:** A bash `trap` cleans up the `xdg-dbus-proxy` and `net-proxy.py` background processes and removes temporary directories (`/tmp/bwrap-dbus-*`, `/tmp/bwrap-net-*`) upon exit.
 * **Declarative Per-Profile Secret Scoping:** The sandbox runs `--clearenv` to scrub all host environment variables. Unlike traditional wrappers that unconditionally pass all API keys whenever network is enabled, `bwrap-sandbox` inspects the active profiles defined in `profiles.conf` and injects *only* the specific variables declared for those profiles (supporting exact names and wildcards). Toolchains, build runners, and unselected agents run with zero exposed keys.

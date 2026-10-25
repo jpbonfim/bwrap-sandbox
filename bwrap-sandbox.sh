@@ -9,7 +9,8 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 ALLOW_NET=false
 ALLOW_NET_FILTERED=false
-ALLOW_GUI=false
+ALLOW_GUI=false                # Enabled by --gui or by any active profile ('gui = true')
+ALLOW_USERNS=false             # Enabled by --allow-userns or by any active profile ('allow_userns = true')
 RESOLVE_SYMLINKS=""            # "" (disabled) | "ro" | "rw"
 WHITELIST_FILE=""
 TARGET_DIR="$(pwd)"
@@ -81,7 +82,7 @@ SELECTED_ENV_PATTERNS=()
 SELECTED_SETENV=()             # Fixed "NAME=VALUE" assignments declared via 'setenv'
 
 # Data structures for profile mounts & permissions
-declare -A MOUNT_PERMS=()       # Path -> "ro" | "rw" (Last profile wins)
+declare -A MOUNT_PERMS=()       # Path -> "ro" | "rw" | "tmpfs" (Last profile wins)
 ORDERED_MOUNT_PATHS=()          # Preserves registration order
 ENABLE_DBUS_AUTH=false          # Enabled if requested by any active profile (Keyring/Secrets)
 ENABLE_DBUS_NOTIFICATIONS=false # Enabled if requested by any active profile (Desktop notifications)
@@ -240,7 +241,7 @@ trap 'forward_winch' WINCH
 # ------------------------------------------------------------------------------
 # Mount Helper Function
 # ------------------------------------------------------------------------------
-# Usage: set_mount <"ro"|"rw"> <path>
+# Usage: set_mount <"ro"|"rw"|"tmpfs"> <path>
 set_mount() {
     local mode="$1"
     local path="$2"
@@ -290,6 +291,24 @@ protect_path() {
         log_info "[+] Created read-only placeholder: $path"
     fi
     set_mount "ro" "$path"
+}
+
+# Usage: mount_tmpfs <path>
+# Hides a directory behind an empty, writable tmpfs inside the sandbox, e.g. a registry that tools must
+# write to inside a read-only mount (~/.cache/ms-playwright/b). Nothing written there reaches the host.
+# bwrap cannot create a mount point inside a read-only mount, so a missing directory is created on the
+# host first (only if its parent directory exists).
+mount_tmpfs() {
+    local path="${1%/}"
+    if [ ! -e "$path" ] && [ ! -L "$path" ] && [ -d "$(dirname "$path")" ]; then
+        mkdir "$path"
+        log_info "[+] Created tmpfs mount point: $path"
+    fi
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+        log_warn "Cannot mount tmpfs on '$path': not a directory. Skipping."
+        return 0
+    fi
+    set_mount "tmpfs" "$path"
 }
 
 # ------------------------------------------------------------------------------
@@ -364,8 +383,8 @@ load_available_profiles() {
     if [ ! -f "$file" ]; then
         AVAILABLE_PROFILES=("dev-tools" "antigravity" "claude" "openai" "deepseek" "mistral" "groq" "none")
         PROFILE_DESCRIPTIONS["dev-tools"]="Mounts host user toolchains (~/.cargo/bin, ~/.nvm, ~/.pyenv, mise, etc.) [Read-Only]"
-        PROFILE_DESCRIPTIONS["antigravity"]="Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache [RO], and filters D-Bus Keyring/Notifications"
-        PROFILE_DESCRIPTIONS["claude"]="Mounts ~/.claude, ~/.claude.json and Claude Code installation [RW], Playwright cache [RO]"
+        PROFILE_DESCRIPTIONS["antigravity"]="Mounts ~/.antigravity, ~/.gemini [RW], Playwright cache and Google Chrome [RO], and filters D-Bus Keyring/Notifications"
+        PROFILE_DESCRIPTIONS["claude"]="Mounts ~/.claude, ~/.claude.json and Claude Code installation [RW], Playwright cache and Google Chrome [RO]"
         PROFILE_DESCRIPTIONS["openai"]="Forwards OpenAI API credentials"
         PROFILE_DESCRIPTIONS["deepseek"]="Forwards DeepSeek API credentials"
         PROFILE_DESCRIPTIONS["mistral"]="Forwards Mistral API credentials"
@@ -436,6 +455,8 @@ apply_profile_from_config() {
                 # expand_path drops the trailing slash that marks directory placeholders
                 [[ "$protect_raw" == */ ]] && protect_exp="$protect_exp/"
                 protect_path "$protect_exp"
+            elif [[ "$line" =~ ^tmpfs[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+                mount_tmpfs "$(expand_path "${BASH_REMATCH[1]}")"
             elif [[ "$line" =~ ^env[[:space:]]*=[[:space:]]*(.*)$ ]]; then
                 local env_pat="${BASH_REMATCH[1]}"
                 env_pat="${env_pat#"${env_pat%%[![:space:]]*}"}"
@@ -449,6 +470,10 @@ apply_profile_from_config() {
                 ENABLE_DBUS_AUTH=true
             elif [[ "$line" =~ ^dbus_notifications[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
                 ENABLE_DBUS_NOTIFICATIONS=true
+            elif [[ "$line" =~ ^gui[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
+                ALLOW_GUI=true
+            elif [[ "$line" =~ ^allow_userns[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
+                ALLOW_USERNS=true
             fi
         fi
     done < "$file"
@@ -483,6 +508,8 @@ apply_profile_fallback() {
             set_mount "rw" "$HOME/.gemini"
             set_mount "ro" "$HOME/.cache/ms-playwright-go"
             set_mount "ro" "$HOME/.cache/ms-playwright"
+            mount_tmpfs "$HOME/.cache/ms-playwright/b"
+            set_mount "ro" "/opt/google/chrome"
             SELECTED_ENV_PATTERNS+=("GEMINI_API_KEY" "ANTIGRAVITY_*")
             ENABLE_DBUS_AUTH=true
             ENABLE_DBUS_NOTIFICATIONS=true
@@ -494,6 +521,8 @@ apply_profile_fallback() {
             set_mount "rw" "$HOME/.local/share/claude"
             set_mount "ro" "$HOME/.local/bin/claude"
             set_mount "ro" "$HOME/.cache/ms-playwright"
+            mount_tmpfs "$HOME/.cache/ms-playwright/b"
+            set_mount "ro" "/opt/google/chrome"
             SELECTED_ENV_PATTERNS+=("ANTHROPIC_*" "CLAUDE_CODE_OAUTH_TOKEN")
             ENABLE_DBUS_NOTIFICATIONS=true
             ;;
@@ -598,6 +627,8 @@ Options:
   -n, --net                Allow unrestricted network access (Default: OFF / isolated)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
   -g, --gui                Expose X11/Wayland display and clipboard (Warning: reduces isolation)
+      --allow-userns       Allow nested user namespaces, e.g. for Chrome's own sandbox
+                           (Warning: exposes more kernel attack surface)
       --resolve-symlinks[=ro|rw]
                            Mount targets of workspace symlinks pointing outside the project
                            ('read'/'write' are aliases; Default: ro; paths listed in
@@ -724,6 +755,10 @@ while [[ $# -gt 0 ]]; do
         ALLOW_GUI=true
         shift
         ;;
+    --allow-userns)
+        ALLOW_USERNS=true
+        shift
+        ;;
     --log-level)
         # Already validated and applied by the pre-scan
         if [[ $# -lt 2 || "$2" == "--" ]]; then
@@ -832,8 +867,7 @@ fi
 BWRAP_ARGS=(
     # 1. Process & Kernel Isolation
     "--unshare-all"     # Unshare user, pid, ipc, uts, cgroup namespaces
-    "--unshare-user"    # Required by bwrap CLI when --disable-userns is passed
-    "--disable-userns"  # Prevent child processes from creating nested user namespaces (Mitigates kernel userns LPE exploits)
+    "--unshare-user"    # Always create a user namespace (required by --disable-userns, added after profiles are applied)
     "--die-with-parent" # Kill all sandbox processes if parent process exits
     "--new-session"     # Disconnect controlling tty (Mitigates TIOCSTI terminal injection)
 
@@ -900,6 +934,7 @@ BWRAP_ARGS+=(
     "--ro-bind-try" "/etc/ld.so.conf" "/etc/ld.so.conf"
     "--ro-bind-try" "/etc/ld.so.conf.d" "/etc/ld.so.conf.d"
     "--ro-bind-try" "/etc/localtime" "/etc/localtime"
+    "--ro-bind-try" "/etc/fonts" "/etc/fonts"
     "--ro-bind-try" "/etc/ssl" "/etc/ssl"
     "--ro-bind-try" "/etc/pki" "/etc/pki"
     "--ro-bind-try" "/etc/ca-certificates" "/etc/ca-certificates"
@@ -912,6 +947,13 @@ BWRAP_ARGS+=(
 for profile in "${SELECTED_PROFILES[@]}"; do
     apply_profile "$profile"
 done
+
+# Nested user namespaces are blocked unless requested via --allow-userns or 'allow_userns = true'
+if [ "$ALLOW_USERNS" = true ]; then
+    log_info "[i] Nested user namespaces are allowed (exposes more kernel attack surface to the sandbox)"
+else
+    BWRAP_ARGS+=("--disable-userns") # Mitigates kernel LPE exploits reachable through unprivileged user namespaces
+fi
 
 # ------------------------------------------------------------------------------
 # Automatically Resolve Symlink Targets (e.g. Dotfiles Repositories)
@@ -942,6 +984,8 @@ is_mount_covered() {
 
 RESOLVED_SYMLINK_TARGETS=()
 for mp in "${ORDERED_MOUNT_PATHS[@]}"; do
+    # Host contents of a tmpfs mount are hidden inside the sandbox, so their symlinks never resolve there
+    [ "${MOUNT_PERMS["$mp"]}" = "tmpfs" ] && continue
     if [ -h "$mp" ]; then
         r="$(realpath "$mp" 2>/dev/null || true)"
         if [ -n "$r" ] && [ -e "$r" ]; then
@@ -995,6 +1039,9 @@ for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
         BWRAP_ARGS+=("--bind" "$target_path" "$target_path")
     elif [ "$mode" = "ro" ]; then
         BWRAP_ARGS+=("--ro-bind" "$target_path" "$target_path")
+    elif [ "$mode" = "tmpfs" ]; then
+        BWRAP_ARGS+=("--tmpfs" "$target_path")
+        continue # Starts empty, so it never contributes executables to PATH
     fi
 
     path_entry=""
@@ -1448,6 +1495,7 @@ fi
 # ------------------------------------------------------------------------------
 if [ "$ALLOW_GUI" = true ]; then
     HAS_GUI_DISPLAY=false
+    HAS_X11_DISPLAY=false
 
     # 1. Wayland Display Server
     WAYLAND_SOCK=""
@@ -1477,6 +1525,7 @@ if [ "$ALLOW_GUI" = true ]; then
             BWRAP_ARGS+=("--bind" "/tmp/.X11-unix" "/tmp/.X11-unix")
             BWRAP_ENV+=("--setenv" "DISPLAY" "$DISPLAY")
             HAS_GUI_DISPLAY=true
+            HAS_X11_DISPLAY=true
 
             # Forward XAUTHORITY if present, or fallback to ~/.Xauthority
             HOST_XAUTH="${XAUTHORITY:-$HOME/.Xauthority}"
@@ -1488,7 +1537,11 @@ if [ "$ALLOW_GUI" = true ]; then
     fi
 
     if [ "$HAS_GUI_DISPLAY" = false ]; then
-        log_warn "'--gui' was specified, but no active X11 or Wayland display was detected on the host."
+        log_warn "GUI access was requested ('--gui' or 'gui = true'), but no active X11 or Wayland display was detected on the host."
+    elif [ "$HAS_X11_DISPLAY" = true ]; then
+        log_info "[i] GUI access is enabled with X11 (sandboxed processes can log keystrokes, capture and inject input into other X11 windows; the clipboard is shared with the host)"
+    else
+        log_info "[i] GUI access is enabled (Wayland only; the clipboard is shared with the host)"
     fi
 fi
 
