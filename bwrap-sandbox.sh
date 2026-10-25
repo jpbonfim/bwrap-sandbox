@@ -141,15 +141,23 @@ restore_protected_symlinks() {
             continue
         fi
 
+        # Failures are reported instead of aborting (errexit), so the remaining cleanup still runs
         if [ -e "$link" ] || [ -L "$link" ]; then
             current="$( [ -L "$link" ] && echo "symlink to '$(readlink "$link")'" || echo "regular $( [ -d "$link" ] && echo directory || echo file)" )"
             backup="$link.sandbox-replaced.$(date +%Y%m%d-%H%M%S)"
-            mv -- "$link" "$backup"
-            log_warn "Protected symlink '$link' was replaced inside the sandbox ($current). Restored link to '$original'; the replacement was kept at '$backup'."
+            if ! mv -- "$link" "$backup"; then
+                log_warn "Protected symlink '$link' was replaced inside the sandbox ($current) and could not be moved aside. Inspect it and restore the link to '$original' manually."
+                continue
+            fi
+            log_warn "Protected symlink '$link' was replaced inside the sandbox ($current). The replacement was kept at '$backup'."
         else
-            log_warn "Protected symlink '$link' was removed inside the sandbox. Restored link to '$original'."
+            log_warn "Protected symlink '$link' was removed inside the sandbox."
         fi
-        ln -s -- "$original" "$link"
+        if ln -s -- "$original" "$link"; then
+            log_warn "Restored protected symlink '$link' -> '$original'."
+        else
+            log_warn "Could not restore protected symlink '$link' -> '$original'. Restore it manually."
+        fi
     done
 }
 
