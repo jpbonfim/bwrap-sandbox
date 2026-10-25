@@ -981,119 +981,10 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Automatically Resolve Symlink Targets (e.g. Dotfiles Repositories)
-# If a mounted directory or file contains symlinks pointing outside the mount
-# (e.g. ~/.config/mise/config.toml -> ~/configs/.config/mise/config.toml),
-# mount the real target path read-only so the symlink does not break inside the sandbox.
-# ------------------------------------------------------------------------------
-is_mount_covered() {
-    local check_path="$1"
-    for existing in "${ORDERED_MOUNT_PATHS[@]}"; do
-        if [ "$check_path" = "$existing" ]; then
-            return 0
-        fi
-        if [ -d "$existing" ] && [[ "$check_path" == "$existing"/* ]]; then
-            return 0
-        fi
-    done
-    case "$check_path" in
-        /usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/lib64|/lib64/*|/sbin|/sbin/*|/etc|/etc/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*)
-            return 0
-            ;;
-    esac
-    if [[ "$check_path" == "$TARGET_DIR" || "$check_path" == "$TARGET_DIR"/* ]]; then
-        return 0
-    fi
-    return 1
-}
-
-RESOLVED_SYMLINK_TARGETS=()
-for mp in "${ORDERED_MOUNT_PATHS[@]}"; do
-    # Host contents of a tmpfs mount are hidden inside the sandbox, so their symlinks never resolve there
-    [ "${MOUNT_PERMS["$mp"]}" = "tmpfs" ] && continue
-    if [ -h "$mp" ]; then
-        r="$(realpath "$mp" 2>/dev/null || true)"
-        if [ -n "$r" ] && [ -e "$r" ]; then
-            if ! is_mount_covered "$r"; then
-                RESOLVED_SYMLINK_TARGETS+=("$r")
-            fi
-        fi
-    elif [ -d "$mp" ]; then
-        while IFS= read -r l; do
-            r="$(realpath "$l" 2>/dev/null || true)"
-            if [ -n "$r" ] && [ -e "$r" ]; then
-                if ! is_mount_covered "$r"; then
-                    RESOLVED_SYMLINK_TARGETS+=("$r")
-                fi
-            fi
-        done < <(find "$mp" -maxdepth 3 -type l 2>/dev/null || true)
-    fi
-done
-
-for st in "${RESOLVED_SYMLINK_TARGETS[@]}"; do
-    if ! is_mount_covered "$st"; then
-        set_mount "ro" "$st"
-    fi
-done
-
-# A file mount is redundant when a parent directory is already mounted with the same mode
-# (e.g. ~/.local/bin/claude from 'claude' and ~/.local/bin from 'dev-tools'). Binding it anyway
-# would target a symlink inside the parent mount and break bwrap.
-is_redundant_file_mount() {
-    local file_path="$1"
-    local file_mode="${MOUNT_PERMS["$file_path"]}"
-    [ -d "$file_path" ] && return 1
-    for existing in "${ORDERED_MOUNT_PATHS[@]}"; do
-        if [ -d "$existing" ] && [[ "$file_path" == "$existing"/* ]] && [ "${MOUNT_PERMS["$existing"]}" = "$file_mode" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-DETECTED_USER_PATHS=()
-
-for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
-    mode="${MOUNT_PERMS["$target_path"]}"
-    if is_redundant_file_mount "$target_path"; then
-        log_debug "Skipping redundant mount [$mode] $target_path (covered by a parent directory mount)"
-        continue
-    fi
-    log_debug "Mount [$mode] $target_path"
-    if [ "$mode" = "rw" ]; then
-        BWRAP_ARGS+=("--bind" "$target_path" "$target_path")
-    elif [ "$mode" = "ro" ]; then
-        BWRAP_ARGS+=("--ro-bind" "$target_path" "$target_path")
-    elif [ "$mode" = "tmpfs" ]; then
-        BWRAP_ARGS+=("--tmpfs" "$target_path")
-        continue # Starts empty, so it never contributes executables to PATH
-    fi
-
-    path_entry=""
-    if [[ ("$target_path" == *"bin"* || "$target_path" == *"shims"*) && -d "$target_path" ]]; then
-        path_entry="$target_path"
-    elif [ -f "$target_path" ] && [ -x "$target_path" ] && [[ "$(basename "$(dirname "$target_path")")" == "bin" ]]; then
-        # Single executable mounted on its own (e.g. ~/.local/bin/claude): expose its parent bin directory
-        path_entry="$(dirname "$target_path")"
-    fi
-    if [ -n "$path_entry" ] && [[ " ${DETECTED_USER_PATHS[*]} " != *" $path_entry "* ]]; then
-        DETECTED_USER_PATHS+=("$path_entry")
-    fi
-done
-
-# Build sanitized PATH (prevent leading colon which POSIX treats as current working directory)
-CLEAN_PATH="/usr/local/bin:/usr/bin:/bin"
-if [ ${#DETECTED_USER_PATHS[@]} -gt 0 ]; then
-    CLEAN_PATH="$(IFS=:; echo "${DETECTED_USER_PATHS[*]}"):$CLEAN_PATH"
-fi
-
-# ------------------------------------------------------------------------------
-# Workspace Symlink Resolution (--resolve-symlinks)
-# Symlinks inside the project pointing outside of it (e.g. shared libraries,
-# 'npm link' packages, files kept in a dotfiles repository) are broken inside
-# the sandbox because their targets are not mounted. When enabled, each external
-# target is mounted in the requested mode, refusing sensitive host paths since a
-# cloned repository may contain hostile links (e.g. 'keys -> ~/.ssh').
+# Symlink Target Safety Checks
+# Symlinks may be planted by the agent (inside rw profile mounts, which persist across
+# sessions) or shipped by a cloned repository, so their targets are checked against
+# symlink-blocklist.txt and refused when they expose host IPC endpoints or devices.
 # ------------------------------------------------------------------------------
 # Usage: path_within <parent> <path> (true if path is parent or lies inside it)
 path_within() {
@@ -1163,8 +1054,10 @@ load_symlink_blocklist() {
 }
 
 # Prints the reason a symlink target must not be mounted (returns 1 if allowed)
+# Usage: symlink_block_reason <path> <ro|rw>
 symlink_block_reason() {
     local p="$1"
+    local mode="$2"
     local blocked
     for blocked in "${SYMLINK_BLOCKED_PATHS[@]}"; do
         if path_within "$blocked" "$p" || path_within "$p" "$blocked"; then
@@ -1172,7 +1065,7 @@ symlink_block_reason() {
             return 0
         fi
     done
-    if [ "$RESOLVE_SYMLINKS" = "rw" ]; then
+    if [ "$mode" = "rw" ]; then
         for blocked in "${SYMLINK_RW_BLOCKED_PATHS[@]}"; do
             if path_within "$blocked" "$p" || path_within "$p" "$blocked"; then
                 echo "path '$blocked' is blocked for read-write mounts"
@@ -1214,11 +1107,154 @@ special_file_reason() {
     return 1
 }
 
+SYMLINK_BLOCKLIST_LOADED=false
+if [ -f "$DEFAULT_SYMLINK_BLOCKLIST" ]; then
+    load_symlink_blocklist "$DEFAULT_SYMLINK_BLOCKLIST"
+    SYMLINK_BLOCKLIST_LOADED=true
+fi
+
+# ------------------------------------------------------------------------------
+# Automatically Resolve Symlink Targets (e.g. Dotfiles Repositories)
+# If a mounted directory or file contains symlinks pointing outside the mount
+# (e.g. ~/.config/mise/config.toml -> ~/configs/.config/mise/config.toml),
+# mount the real target path read-only so the symlink does not break inside the sandbox.
+# ------------------------------------------------------------------------------
+is_mount_covered() {
+    local check_path="$1"
+    for existing in "${ORDERED_MOUNT_PATHS[@]}"; do
+        if [ "$check_path" = "$existing" ]; then
+            return 0
+        fi
+        if [ -d "$existing" ] && [[ "$check_path" == "$existing"/* ]]; then
+            return 0
+        fi
+    done
+    case "$check_path" in
+        /usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/lib64|/lib64/*|/sbin|/sbin/*|/etc|/etc/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*)
+            return 0
+            ;;
+    esac
+    if [[ "$check_path" == "$TARGET_DIR" || "$check_path" == "$TARGET_DIR"/* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+RESOLVED_SYMLINK_TARGETS=()
+
+# Registers the target of a symlink found inside a profile mount. Unlike the mount paths, which
+# come from the profiles, these links may have been planted by the agent in an earlier session
+# (rw mounts persist), so they get the same checks as --resolve-symlinks.
+# Usage: register_profile_symlink_target <link>
+register_profile_symlink_target() {
+    local link="$1"
+    local target reason
+    target="$(realpath "$link" 2>/dev/null || true)"
+    if [ -z "$target" ] || [ ! -e "$target" ] || is_mount_covered "$target"; then
+        return 0
+    fi
+
+    if [ "$SYMLINK_BLOCKLIST_LOADED" = false ]; then
+        reason="symlink blocklist '$DEFAULT_SYMLINK_BLOCKLIST' not found (run '$(basename "$0") --init')"
+    else
+        reason="$(symlink_block_reason "$target" "ro" || special_file_reason "$target" || true)"
+    fi
+    if [ -n "$reason" ]; then
+        log_warn "Skipping profile symlink '$link' -> '$target': $reason."
+        return 0
+    fi
+
+    log_debug "Resolved profile symlink '$link' -> '$target' [ro]"
+    RESOLVED_SYMLINK_TARGETS+=("$target")
+}
+
+for mp in "${ORDERED_MOUNT_PATHS[@]}"; do
+    # Host contents of a tmpfs mount are hidden inside the sandbox, so their symlinks never resolve there
+    [ "${MOUNT_PERMS["$mp"]}" = "tmpfs" ] && continue
+    if [ -h "$mp" ]; then
+        # The mount path itself comes from the profile configuration
+        r="$(realpath "$mp" 2>/dev/null || true)"
+        if [ -n "$r" ] && [ -e "$r" ]; then
+            if ! is_mount_covered "$r"; then
+                RESOLVED_SYMLINK_TARGETS+=("$r")
+            fi
+        fi
+    elif [ -d "$mp" ]; then
+        while IFS= read -r -d '' l; do
+            register_profile_symlink_target "$l"
+        done < <(find "$mp" -maxdepth 3 -type l -print0 2>/dev/null || true)
+    fi
+done
+
+for st in "${RESOLVED_SYMLINK_TARGETS[@]}"; do
+    if ! is_mount_covered "$st"; then
+        set_mount "ro" "$st"
+    fi
+done
+
+# A file mount is redundant when a parent directory is already mounted with the same mode
+# (e.g. ~/.local/bin/claude from 'claude' and ~/.local/bin from 'dev-tools'). Binding it anyway
+# would target a symlink inside the parent mount and break bwrap.
+is_redundant_file_mount() {
+    local file_path="$1"
+    local file_mode="${MOUNT_PERMS["$file_path"]}"
+    [ -d "$file_path" ] && return 1
+    for existing in "${ORDERED_MOUNT_PATHS[@]}"; do
+        if [ -d "$existing" ] && [[ "$file_path" == "$existing"/* ]] && [ "${MOUNT_PERMS["$existing"]}" = "$file_mode" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+DETECTED_USER_PATHS=()
+
+for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
+    mode="${MOUNT_PERMS["$target_path"]}"
+    if is_redundant_file_mount "$target_path"; then
+        log_debug "Skipping redundant mount [$mode] $target_path (covered by a parent directory mount)"
+        continue
+    fi
+    log_debug "Mount [$mode] $target_path"
+    if [ "$mode" = "rw" ]; then
+        BWRAP_ARGS+=("--bind" "$target_path" "$target_path")
+    elif [ "$mode" = "ro" ]; then
+        BWRAP_ARGS+=("--ro-bind" "$target_path" "$target_path")
+    elif [ "$mode" = "tmpfs" ]; then
+        BWRAP_ARGS+=("--tmpfs" "$target_path")
+        continue # Starts empty, so it never contributes executables to PATH
+    fi
+
+    path_entry=""
+    if [[ ("$target_path" == *"bin"* || "$target_path" == *"shims"*) && -d "$target_path" ]]; then
+        path_entry="$target_path"
+    elif [ -f "$target_path" ] && [ -x "$target_path" ] && [[ "$(basename "$(dirname "$target_path")")" == "bin" ]]; then
+        # Single executable mounted on its own (e.g. ~/.local/bin/claude): expose its parent bin directory
+        path_entry="$(dirname "$target_path")"
+    fi
+    if [ -n "$path_entry" ] && [[ " ${DETECTED_USER_PATHS[*]} " != *" $path_entry "* ]]; then
+        DETECTED_USER_PATHS+=("$path_entry")
+    fi
+done
+
+# Build sanitized PATH (prevent leading colon which POSIX treats as current working directory)
+CLEAN_PATH="/usr/local/bin:/usr/bin:/bin"
+if [ ${#DETECTED_USER_PATHS[@]} -gt 0 ]; then
+    CLEAN_PATH="$(IFS=:; echo "${DETECTED_USER_PATHS[*]}"):$CLEAN_PATH"
+fi
+
+# ------------------------------------------------------------------------------
+# Workspace Symlink Resolution (--resolve-symlinks)
+# Symlinks inside the project pointing outside of it (e.g. shared libraries,
+# 'npm link' packages, files kept in a dotfiles repository) are broken inside
+# the sandbox because their targets are not mounted. When enabled, each external
+# target is mounted in the requested mode, refusing sensitive host paths since a
+# cloned repository may contain hostile links (e.g. 'keys -> ~/.ssh').
+# ------------------------------------------------------------------------------
 declare -A WORKSPACE_LINK_SOURCES=() # Sandbox destination (path the link points to) -> resolved host source
 
 if [ -n "$RESOLVE_SYMLINKS" ]; then
-    load_symlink_blocklist "$DEFAULT_SYMLINK_BLOCKLIST"
-
+    # The blocklist was loaded with the symlink safety checks (its presence is required above)
     while IFS= read -r -d '' link && IFS= read -r -d '' raw_target; do
         [ -z "$raw_target" ] && continue
         if [[ "$raw_target" != /* ]]; then
@@ -1245,7 +1281,7 @@ if [ -n "$RESOLVE_SYMLINKS" ]; then
 
         # Check both the path the link points to and its fully resolved location (the directory
         # scan for special files runs last, since it is the most expensive check)
-        reason="$(symlink_block_reason "$dest" || symlink_block_reason "$src" || special_file_reason "$src" || true)"
+        reason="$(symlink_block_reason "$dest" "$RESOLVE_SYMLINKS" || symlink_block_reason "$src" "$RESOLVE_SYMLINKS" || special_file_reason "$src" || true)"
 
         if [ -n "$reason" ]; then
             log_warn "Skipping workspace symlink '$rel_link' -> '$dest': $reason."
