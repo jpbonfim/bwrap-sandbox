@@ -1383,15 +1383,25 @@ git_worktree_config_enabled() {
 # Git reads config and hooks from the directory named in '<gitdir>/commondir' (used by linked
 # worktrees). A repository's own git directory never has one, so the agent could create it to
 # redirect host-side git to a config it controls. A placeholder pointing to the git directory
-# itself ('.') is a no-op for git, and it stays on the host so concurrent sessions in the same
-# repository never remove each other's protection.
+# itself is a no-op for git, and it stays on the host so concurrent sessions in the same
+# repository never remove each other's protection. It must be './': libgit2 (used by prompts
+# such as powerlevel10k's gitstatus) stops recognizing the repository when it contains '.',
+# so placeholders created with '.' by earlier versions are rewritten.
 # Usage: ensure_commondir_placeholder <gitdir>
 ensure_commondir_placeholder() {
     local commondir_file="$1/commondir"
+    local content
     if [ ! -e "$commondir_file" ] && [ ! -L "$commondir_file" ]; then
-        echo "." > "$commondir_file"
+        echo "./" > "$commondir_file"
         log_debug "Created Git commondir placeholder: $commondir_file"
-    elif [ -L "$commondir_file" ] || [ "$(cat "$commondir_file" 2>/dev/null)" != "." ]; then
+        return 0
+    fi
+
+    content="$(cat "$commondir_file" 2>/dev/null || true)"
+    if [ ! -L "$commondir_file" ] && [ "$content" = "." ]; then
+        echo "./" > "$commondir_file"
+        log_debug "Rewrote legacy Git commondir placeholder: $commondir_file"
+    elif [ -L "$commondir_file" ] || [ "$content" != "./" ]; then
         echo "Security Error: '$commondir_file' redirects Git config and hooks to another directory." >&2
         echo "A repository's own git directory never contains this file; it may have been planted to run commands on the host." >&2
         echo "Inspect it and remove it before starting the sandbox." >&2
