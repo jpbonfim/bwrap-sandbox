@@ -167,31 +167,15 @@ Everything after `--` is the command to run inside the sandbox; without it, an i
 
 > [!WARNING]
 > #### Security implications of `--gui`
-> `--gui` (or `gui = true`) forwards the host's X11 and/or Wayland display and the clipboard. This is what allows pasting images into a terminal agent, running headed browsers (Playwright with `headless: false`) and showing plots.
->
-> * **X11 does not isolate clients.** Any process in the sandbox can read keystrokes sent to other X11 windows, capture their contents and inject input into them (XTest). If a host terminal runs under X11, injected keystrokes run commands **outside the sandbox**, which is a full escape. On a Wayland session the X11 socket belongs to Xwayland, so only applications running through Xwayland are exposed (`xlsclients` on the host lists them).
-> * **Wayland isolates clients** from each other's input and screen contents. Screen capture goes through the desktop portal, which the D-Bus proxy does not expose.
-> * **The clipboard is shared under both.** A sandboxed process can replace what you copied with a malicious command that runs when you paste it into a host terminal, and it can read the clipboard while it has focus.
-> * **Windows can be spoofed under both.** The sandbox can open a window that looks like a password, keyring or sudo prompt.
->
-> Enable `--gui` only when you need the display or the clipboard (headless browsers don't), and read pasted commands before running them on the host.
+> Gives the sandbox the host display and clipboard. Under X11 it can read and inject input into other windows, including host terminals; under both X11 and Wayland it can read or replace the clipboard and draw fake prompts. Enable it only when you need a visible window or clipboard images.
 
 > [!WARNING]
 > #### Security implications of `--net`
-> `--net` shares the host's network namespace instead of creating one. Besides the internet and your LAN, the sandbox can then reach:
->
-> * **Services on the host loopback** (`127.0.0.1`/`::1`): development servers, databases, the Docker API over TCP, a browser's remote debugging port. These usually assume only trusted local processes connect.
-> * **Abstract Unix sockets**, which belong to the network namespace rather than the filesystem, so the private `/tmp` does not hide them. X11, for example, listens on `@/tmp/.X11-unix/X0`; if the X server accepts local connections from your user without a cookie (common with Xwayland's `si:localuser`), the sandbox gets the X11 access described under `--gui` without that flag.
->
-> Prefer `--net-filtered`. Keep `--net` for short, trusted commands, such as a build that downloads from repositories not on the whitelist.
+> Shares the host network without filtering, including services listening on the host loopback and abstract Unix sockets (such as X11's). Prefer `--net-filtered`, and keep `--net` for short, trusted commands.
 
 > [!WARNING]
 > #### Security implications of `--allow-userns`
-> By default the sandbox passes `--disable-userns` to bwrap, so nothing inside it can create nested user namespaces. `--allow-userns` (or `allow_userns = true`) removes that restriction, which software that builds its own sandbox needs, such as Chrome/Chromium (otherwise it must run with `--no-sandbox`).
->
-> A nested namespace does not escape bwrap by itself. The problem is that an unprivileged user namespace grants capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) over kernel subsystems normally reserved for root, such as nf_tables, mounts and some filesystems, and many local privilege escalation exploits (e.g. CVE-2024-1086 in nf_tables) are only reachable this way. With this option, **any code in the sandbox, including commands an agent runs because of a prompt injection, can reach that attack surface, and a working kernel exploit gives root on the host**.
->
-> For headed browsers, the trade-off is: keeping `--disable-userns` and running the browser with `--no-sandbox` (e.g. `@playwright/mcp --no-sandbox`) leaves a compromised page with only what bwrap already allows, while `--allow-userns` keeps the browser's sandbox but weakens the outer one. Prefer `--no-sandbox` when the browser only visits trusted sites, keep the kernel updated, and enable `--allow-userns` only for sessions that need it. On Ubuntu, AppArmor (`kernel.apparmor_restrict_unprivileged_userns`) may still block nested namespaces.
+> Lets processes in the sandbox create user namespaces, which Chrome needs for its own sandbox. It also exposes kernel interfaces normally reserved for root, so a kernel bug becomes a way out of the sandbox. For headed browsers on trusted sites, running the browser with `--no-sandbox` instead is usually the safer choice.
 
 ---
 
@@ -232,11 +216,7 @@ Notes on the `claude` profile:
 Notes on `antigravity:strict`: it protects `~/.gemini/config/` (hooks, MCP config, skills, scripts, plugins; per-project state stays writable), the CLI's `settings.json`, global instructions (`GEMINI.md`, `AGENTS.md`), the authentication config (`~/.config/antigravity/`), executables (`~/.gemini/bin/`, the `agentapi` helpers, `~/.cache/antigravity/bin/`), and the IDE's extensions, settings, keybindings and wrappers (`~/.antigravity/{extensions,bin}/`, `argv.json`, `~/.antigravity-ide/`, `~/.config/Antigravity/`, `~/.config/Antigravity IDE/`). Updates from inside the sandbox fail; update on the host. If `GEMINI.md` or `AGENTS.md` are symlinks, their targets are protected and the links are checked on exit (see `protect`).
 
 > [!WARNING]
-> **Agents can rewrite their own configuration.** A profile that mounts an agent's configuration read-write (`~/.claude`, `~/.claude.json`, `~/.gemini`) lets the agent, or a prompt injection steering it, change that configuration. Hooks, MCP servers, plugins, skills and instruction files can all run commands or change the agent's behavior. That opens two paths:
-> * **Code execution on the host:** if you ever run the agent **outside** the sandbox, a hook or MCP server planted from inside runs with your full user privileges.
-> * **Persistence across projects:** the configuration is shared, so something planted while working on project A also runs in later sandboxed sessions for project B.
->
-> Project configuration inside the workspace (e.g. `<project>/.claude/settings.json`) has the same problem. Mitigations: run the agent only through the sandbox, keep the configuration directory under Git and review `git diff` from time to time, use the `strict` variants (or `protect` in your own profiles), or give the sandbox its own configuration directory (e.g. `CLAUDE_CONFIG_DIR`).
+> **Writable agent configuration.** The base `claude` and `antigravity` profiles mount the agent's configuration read-write, so the agent can add hooks, MCP servers or plugins that later run on the host (if you run the agent outside the sandbox) or in other projects. Use the `strict` variants, `protect` in your own profiles, or a separate configuration directory (e.g. `CLAUDE_CONFIG_DIR`) to prevent this.
 
 ### 4. Custom domain whitelist
 
@@ -280,7 +260,7 @@ Each mounted or refused link is reported at startup (`[+] Resolved workspace sym
 * Links are resolved once, at startup, and one level deep. Links the agent creates later, or links inside a mounted target, are not resolved.
 
 > [!WARNING]
-> A cloned repository can ship hostile symlinks (e.g. `keys -> ~/.ssh`). The blocklist is best-effort: read the startup report and use `--resolve-symlinks` only on projects you trust. Prefer `ro`; `rw` lets the agent modify files outside the workspace that the host may later run or trust. For a permanent setup, an explicit `mount = ro:<path>` in a profile is safer.
+> A repository can contain symlinks to sensitive host paths, and the blocklist is best-effort. Use `--resolve-symlinks` only on projects you trust, check the startup report, and prefer `ro`.
 
 ---
 
@@ -325,44 +305,16 @@ A host variable reaches the sandbox only if an `env` directive in an active prof
 
 ## How it works
 
-```
-+-------------------------------------------------------------------------+
-| HOST                                                                    |
-|  ~/.ssh, ~/.aws, /etc/shadow             (not mounted)                  |
-|  /usr, ~/.cargo/bin                      (mounted read-only)            |
-|  /run/user/$UID/bus                      (behind xdg-dbus-proxy)        |
-|  /tmp/bwrap-net-XXXXXX/proxy.sock        (behind net-proxy.py)          |
-+-------------------------------------------------------------------------+
-       |                                             |
-       | filtered D-Bus socket                       | Unix socket
-       v                                             v
-+------------------------------------+   +--------------------------------+
-| xdg-dbus-proxy                     |   | net-proxy.py (on the host)     |
-|  ALLOW: org.freedesktop.secrets    |   |  ALLOW: whitelisted domains    |
-|  ALLOW: org.gnome.keyring          |   |  DENY:  everything else (403)  |
-|  ALLOW: org.freedesktop.           |   +--------------------------------+
-|         Notifications              |                   |
-|  (each only if the profile asks)   |                   | bind mount
-|  DENY:  everything else            |                   v
-+------------------------------------+   +--------------------------------+
-                   |                     | BWRAP SANDBOX                  |
-                   +====================>|  Filesystem                    |
-                                         |   /usr, parts of /etc  (ro)    |
-                                         |   /tmp, $HOME          (tmpfs) |
-                                         |   <workspace>          (rw)    |
-                                         |     .git/{hooks,config} (ro)   |
-                                         |  Network                       |
-                                         |   own namespace, no routes     |
-                                         |   127.0.0.1:18080 relay        |
-                                         |  Processes                     |
-                                         |   private PID namespace        |
-                                         |   new session (no TIOCSTI)     |
-                                         +--------------------------------+
-```
+* **Filtered network (`-nf`):** the sandbox keeps its own network namespace (`--unshare-net`), with no routes out. Inside, a relay on `127.0.0.1:18080` (socat or Python) forwards to a Unix socket mounted from the host, where `net-proxy.py` checks each request against `allowed-domains.txt`. `HTTP_PROXY`/`HTTPS_PROXY` point at the relay, so no port is opened on the host:
 
-### Details
+  ```
+  sandbox (own netns, no routes)              host
+    app ──HTTP_PROXY──▶ 127.0.0.1:18080
+                        relay (socat/python) ──unix socket──▶ net-proxy.py ──▶ allowed domains
+                                                                └─ 403 for everything else
+  ```
 
-* **Filtered network (`-nf`):** the sandbox keeps its own network namespace (`--unshare-net`). Inside, a relay on `127.0.0.1:18080` (socat or Python) forwards to a Unix socket mounted from the host, where `net-proxy.py` checks each request against `allowed-domains.txt`. `HTTP_PROXY`/`HTTPS_PROXY` point at the relay. Domains or ports not on the list get `403 Forbidden`, and direct TCP/UDP connections fail with `Network is unreachable`. Host services are reachable only when listed explicitly, e.g. `localhost:11434` for Ollama, `127.0.0.1:8000,8080`, or ranges such as `3000-3010`.
+  Domains or ports not on the list get `403 Forbidden`, and direct TCP/UDP connections fail with `Network is unreachable`. Host services are reachable only when listed explicitly, e.g. `localhost:11434` for Ollama, `127.0.0.1:8000,8080`, or ranges such as `3000-3010`.
 
   The proxy only sees the host and port the client asks for. Traffic inside an allowed `CONNECT` tunnel (TLS SNI, the inner `Host` header, any protocol on an allowed port) is not inspected, so a whitelisted CDN or shared hosting platform can relay requests to other sites it serves (domain fronting). On shared platforms, list specific hostnames rather than wildcards. Request heads must arrive within 30 seconds and have at most 100 header lines; upstream connections time out after 15 seconds; established tunnels have no idle timeout.
 * **Git SSH remotes under `-nf`:** SSH (port 22) cannot go through an HTTP proxy, so with `-nf` `GIT_CONFIG_PARAMETERS` rewrites `git@github.com:` and `git@gitlab.com:` to `https://`, and `git clone`/`git fetch` go through the proxy.
