@@ -656,7 +656,8 @@ Options:
       --list-profiles      List available permission profiles and descriptions
   -c, --config PATH        Path to profiles configuration file (Default: profiles.conf)
       --init               Initialize profiles.conf, allowed-domains.txt and symlink-blocklist.txt from templates and exit
-  -n, --net                Allow unrestricted network access (Default: OFF / isolated)
+  -n, --net                Allow unrestricted network access, sharing the host network
+                           namespace (Default: OFF / isolated; see README)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
   -g, --gui                Expose X11/Wayland display and clipboard (Warning: reduces isolation)
       --allow-userns       Allow nested user namespaces, e.g. for Chrome's own sandbox
@@ -1521,6 +1522,8 @@ fi
 # ------------------------------------------------------------------------------
 if [ "$ALLOW_NET" = true ]; then
     BWRAP_ARGS+=("--share-net")
+    # Abstract Unix sockets belong to the network namespace, so filesystem isolation does not hide them
+    log_info "[i] Unrestricted network shares the host network namespace: host loopback services and abstract Unix sockets (e.g. X11's @/tmp/.X11-unix) are reachable"
 
     # Handle systemd-resolved and standard resolv.conf symlinks safely
     if [ -f /etc/resolv.conf ]; then

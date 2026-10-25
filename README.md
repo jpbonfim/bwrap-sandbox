@@ -148,7 +148,8 @@ Options:
       --list-profiles      List available permission profiles and descriptions
   -c, --config PATH        Path to profiles configuration file (Default: profiles.conf)
       --init               Initialize profiles.conf, allowed-domains.txt and symlink-blocklist.txt from templates and exit
-  -n, --net                Allow unrestricted network access (Default: OFF / isolated)
+  -n, --net                Allow unrestricted network access, sharing the host network
+                           namespace (Default: OFF / isolated; see README)
   -nf, --net-filtered      Allow domain-filtered network access via strict proxy
   -g, --gui                Expose X11/Wayland display and clipboard (Warning: reduces isolation)
       --allow-userns       Allow nested user namespaces, e.g. for Chrome's own sandbox
@@ -179,6 +180,15 @@ Use `--log-level debug` to inspect which profiles were applied and every mount w
 > * **Both protocols allow spoofed windows.** The sandbox can open a window imitating a password, keyring or sudo prompt and capture what you type into it.
 >
 > Only enable `--gui` when you explicitly require graphical or clipboard capabilities (headless browsers do not need it), and check pasted commands before running them in a host terminal.
+
+> [!WARNING]
+> #### Security Implications of `--net`
+> Unrestricted network access (`-n, --net`) shares the host's network namespace instead of creating a new one. Besides the internet and your local network, the sandbox can then reach:
+>
+> * **Services listening on the host loopback** (`127.0.0.1`/`::1`), such as development servers, databases, the Docker API over TCP or a browser's remote debugging port, which usually assume that only local, trusted processes connect to them.
+> * **Abstract Unix sockets**, which belong to the network namespace rather than the filesystem, so the private `/tmp` does not hide them. For example, X11 listens on `@/tmp/.X11-unix/X0`: if the X server accepts local connections from your user without a cookie (common with Xwayland's `si:localuser`), the sandbox gets the X11 access described under `--gui` even without that flag.
+>
+> Prefer `--net-filtered`, and use `--net` only for short, trusted commands (e.g. a build that downloads from unlisted repositories).
 
 > [!WARNING]
 > #### Security Implications of `--allow-userns`
