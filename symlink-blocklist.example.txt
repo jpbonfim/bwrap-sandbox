@@ -90,6 +90,9 @@
 /run
 /var/run
 /etc
+# Shared temporary directories hold host IPC sockets (tmux, X11, SSH agents, IDEs)
+/tmp
+/var/tmp
 
 # ------------------------------------------------------------------------------
 # 6. Host-Executed Locations (Blocked Read-Write Only)

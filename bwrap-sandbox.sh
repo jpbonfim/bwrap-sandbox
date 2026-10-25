@@ -1194,6 +1194,26 @@ symlink_block_reason() {
     return 1
 }
 
+# Prints why a mount source would expose host IPC endpoints or devices (returns 1 if it does not).
+# Sockets keep accepting connections through read-only mounts (tmux, D-Bus, Docker, SSH or GPG
+# agents), so directories are scanned for them as well.
+special_file_reason() {
+    local src="$1"
+    local found
+    if [ -S "$src" ] || [ -b "$src" ] || [ -c "$src" ] || [ -p "$src" ]; then
+        echo "sockets, devices and FIFOs are never exposed"
+        return 0
+    fi
+    if [ -d "$src" ]; then
+        found="$(find "$src" \( -type s -o -type b -o -type c -o -type p \) -print -quit 2>/dev/null || true)"
+        if [ -n "$found" ]; then
+            echo "it contains a socket, device or FIFO ('$found'), which are never exposed"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 declare -A WORKSPACE_LINK_SOURCES=() # Sandbox destination (path the link points to) -> resolved host source
 
 if [ -n "$RESOLVE_SYMLINKS" ]; then
@@ -1223,12 +1243,9 @@ if [ -n "$RESOLVE_SYMLINKS" ]; then
             continue # Broken on the host as well
         fi
 
-        if [ -S "$src" ] || [ -b "$src" ] || [ -c "$src" ] || [ -p "$src" ]; then
-            reason="sockets, devices and FIFOs are never exposed"
-        else
-            # Check both the path the link points to and its fully resolved location
-            reason="$(symlink_block_reason "$dest" || symlink_block_reason "$src" || true)"
-        fi
+        # Check both the path the link points to and its fully resolved location (the directory
+        # scan for special files runs last, since it is the most expensive check)
+        reason="$(symlink_block_reason "$dest" || symlink_block_reason "$src" || special_file_reason "$src" || true)"
 
         if [ -n "$reason" ]; then
             log_warn "Skipping workspace symlink '$rel_link' -> '$dest': $reason."
