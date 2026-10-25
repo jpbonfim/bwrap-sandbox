@@ -1,32 +1,30 @@
 # bwrap-sandbox
 
-A security-hardened, zero-daemon sandbox built on [Bubblewrap (`bwrap`)](https://github.com/containers/bubblewrap) designed to run autonomous AI coding agents (such as Antigravity and Claude Code) in full autonomous (*YOLO*) mode with minimal overhead and strict boundaries.
+A Bash wrapper around [Bubblewrap (`bwrap`)](https://github.com/containers/bubblewrap) for running AI coding agents such as Claude Code and Antigravity in unattended (*YOLO*) mode. The agent gets the project directory, the toolchains and credentials you choose, and optionally a network filtered by domain. Your real `$HOME`, SSH keys, shell history and the rest of the host stay out of reach.
 
-While completely agent-agnostic, it was actively developed and battle-tested with Google's Antigravity CLI (agy).
-
----
-
-## Key Features
-
-* **Zero-Daemon, Near-Zero Overhead:** Runs natively via Linux kernel namespaces without Docker daemons, background agents, or VM virtualization costs (< 2 MB RAM usage, sub-10ms startup).
-* **Ephemeral `$HOME` (`tmpfs`):** Masks your real home directory with a temporary in-RAM filesystem. Sensitive folders (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, shell histories) do not exist inside the sandbox.
-* **Composable Permission Profiles:** Combine multiple profiles (e.g., `-p dev-tools,antigravity`) with fine-grained Read-Only (`ro`) and Read-Write (`rw`) controls. If conflicting permissions arise, the last specified profile takes precedence.
-* **Filtered D-Bus Keyring Proxy:** Safely isolates Google OAuth and Secret Service tokens via `xdg-dbus-proxy`. Agents can query the GNOME Keyring without granting access to `systemd` or other host control interfaces.
-* **Modular Toolchain Access (`dev-tools`):** Exposes host compilers, package managers, and runtimes (`~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `mise`, etc.) strictly in **read-only** mode so the agent can build and test without corrupting toolchain binaries.
-* **Strict Domain-Filtered Network Access (`-nf, --net-filtered`):** Enforces outbound domain whitelisting via an unshared network namespace (`--unshare-net`) and an ephemeral Unix domain socket proxy. Zero external port exposure on the host, blocks direct IP/raw-socket bypasses, and prevents lateral access to host `127.0.0.1` services.
-* **Network Isolation by Default:** Blocks all inbound and outbound network connectivity unless explicitly granted via `--net-filtered` (domain-whitelisted) or `--net` (unrestricted).
-* **Workspace Hardening:** Mounts only the target workspace as read-write. Protects against Git hook and config poisoning by mounting the metadata that decides which hooks and config host-side Git uses read-only, while commits keep working inside the sandbox.
-* **Terminal Injection Defense:** Uses `--new-session` to detach the controlling TTY, neutralizing `ioctl(TIOCSTI)` attacks that attempt to push keystrokes back to the host shell.
-* **Environment Sanitization:** Runs `--clearenv` to scrub host secrets, selectively passing only required UI/locale variables and explicit AI API keys when network access is enabled.
+There is no daemon, container image or VM: each run is a set of Linux namespaces that disappears when the command exits. The script works with any command, but it was developed mostly against the Antigravity CLI (`agy`) and Claude Code, and the bundled profiles reflect that.
 
 ---
 
-## Prerequisites
+## What it does
 
-* **Bubblewrap (`bwrap`)**: Required for kernel namespace isolation (`sudo apt install bubblewrap`).
-* **Python 3**: Only required if using domain-filtered network access (`-nf, --net-filtered`) to run `net-proxy.py`. All profile parsing, mounts, and sandbox controls are **100% native Bash**.
-* **xdg-dbus-proxy**: Required only for profiles using filtered GNOME Keyring / Secret Service (`sudo apt install xdg-dbus-proxy`).
-* **socat**: *(Optional, recommended)* Accelerates internal network loopback relay with minimal RAM overhead (~1.5 MB).
+* **Hides `$HOME`.** `$HOME` is replaced by an empty tmpfs, so `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, shell histories and everything else there do not exist inside the sandbox. Only paths mounted by a profile come back.
+* **Mounts the workspace read-write, the system read-only.** The project directory is mounted at its real path. `/usr` and a minimal set of `/etc` files are read-only; `/tmp` and `/dev/shm` are private tmpfs mounts.
+* **Uses composable profiles.** Profiles in an INI file declare which paths are mounted (`ro`/`rw`), which environment variables are forwarded and which extra capabilities are enabled. They can be combined (`-p dev-tools,claude`), and on conflicting mounts the last one wins.
+* **Has no network by default.** `--net-filtered` (`-nf`) allows HTTP/HTTPS only to domains in a whitelist, through a proxy reached over a Unix socket; the sandbox keeps its own network namespace. `--net` shares the host network without filtering.
+* **Clears the environment.** The sandbox starts with `--clearenv`. Apart from locale and terminal basics, only variables listed by the active profiles are forwarded, so `-p dev-tools` runs with no API keys at all.
+* **Protects host-side Git.** Hooks, config and the files that point Git elsewhere are mounted read-only, so the agent cannot plant code that runs the next time you use Git on the host. Commits still work inside the sandbox.
+* **Filters D-Bus.** Profiles that need the keyring or desktop notifications get an `xdg-dbus-proxy` that exposes only those services; `systemd --user` and other host interfaces stay unreachable.
+* **Blocks terminal injection.** `--new-session` detaches the controlling TTY, so `ioctl(TIOCSTI)` cannot push keystrokes into the host shell.
+
+---
+
+## Requirements
+
+* **Bubblewrap (`bwrap`)**, required.
+* **Python 3**, only for `--net-filtered` (it runs `net-proxy.py`). Everything else is Bash.
+* **xdg-dbus-proxy**, only for profiles that enable `dbus_auth` or `dbus_notifications`.
+* **socat**, optional. Used for the in-sandbox relay to the network proxy; without it, a small Python relay is used instead.
 
 ```bash
 # Debian / Ubuntu
@@ -39,70 +37,68 @@ sudo dnf install bubblewrap xdg-dbus-proxy socat python3
 sudo pacman -S bubblewrap xdg-dbus-proxy socat python
 ```
 
-> **Ubuntu 24.04 LTS Notice:** If you encounter `bwrap: No permissions to creating new namespace`, enable unprivileged user namespaces via sysctl:
+> **Ubuntu 24.04 and later:** AppArmor restricts unprivileged user namespaces by default. If `bwrap` fails with `No permissions to creating new namespace`, lift the restriction:
 > ```bash
 > sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 > ```
 
 ---
 
-## Installation & Initialization
+## Installation
 
-1. Clone or download the repository:
-```bash
-git clone https://github.com/jpbonfim/bwrap-sandbox.git
-cd bwrap-sandbox
-chmod +x bwrap-sandbox.sh
-```
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/jpbonfim/bwrap-sandbox.git
+   cd bwrap-sandbox
+   chmod +x bwrap-sandbox.sh
+   ```
 
-2. Initialize your local configuration:
-```bash
-./bwrap-sandbox.sh --init
-```
-*(Alternatively, simply running `./bwrap-sandbox.sh` for the first time will automatically instantiate your configuration files).*
+2. Create your local configuration from the templates:
+   ```bash
+   ./bwrap-sandbox.sh --init
+   ```
+   The first regular run does the same if the files are missing.
 
-3. *(Optional)* Create a symlink in your user path for global access:
-```bash
-mkdir -p ~/.local/bin
-ln -sf "$(pwd)/bwrap-sandbox.sh" ~/.local/bin/bwrap-sandbox
-```
-*(The script automatically resolves its canonical directory following symlinks, ensuring it seamlessly locates `profiles.conf`, `allowed-domains.txt`, and `net-proxy.py` from anywhere on your system).*
+3. Optionally, put it on your `PATH`:
+   ```bash
+   mkdir -p ~/.local/bin
+   ln -sf "$(pwd)/bwrap-sandbox.sh" ~/.local/bin/bwrap-sandbox
+   ```
+   The script resolves symlinks to find its own directory, so it still finds `profiles.conf`, `allowed-domains.txt` and `net-proxy.py` when called through the link.
 
 ---
 
 ## Configuration
 
-All profiles, permissions, and network domain rules are declarative and stored in local configuration files that are ignored by Git (`.gitignore`). This allows you to customize paths, API credentials, and whitelist domains locally without causing merge conflicts when pulling upstream updates.
+Each configuration file has a versioned template and a local copy, ignored by Git, that the script actually reads. Edit the local copies; pulling updates will not conflict with them.
 
-| File | Status | Description |
+| Template (versioned) | Local copy (ignored) | Contents |
 | --- | --- | --- |
-| `profiles.example.conf` | Versioned in Git | Template defining default profiles and permissions. |
-| `profiles.conf` | Ignored by Git | Your active, locally editable profile configuration. |
-| `allowed-domains.example.txt` | Versioned in Git | Template listing standard agent endpoints (Google, Anthropic, NPM, etc.). |
-| `allowed-domains.txt` | Ignored by Git | Your active domain whitelist used by `-nf`. |
-| `symlink-blocklist.example.txt` | Versioned in Git | Template listing sensitive host paths (credentials, shell startup files, system paths, etc.). |
-| `symlink-blocklist.txt` | Ignored by Git | Your active blocklist of host paths never mounted by `--resolve-symlinks`. |
+| `profiles.example.conf` | `profiles.conf` | Profiles: mounts, environment variables, capabilities. |
+| `allowed-domains.example.txt` | `allowed-domains.txt` | Domains and ports allowed by `-nf` (agent APIs, GitHub, npm, PyPI, etc.). |
+| `symlink-blocklist.example.txt` | `symlink-blocklist.txt` | Host paths that symlink resolution never mounts (credentials, shell startup files, system paths, etc.). |
 
-### Configuring Profiles (`profiles.conf`)
+### Profiles (`profiles.conf`)
 
-Profiles use standard INI syntax. Any section `[profile-name]` automatically becomes an available profile selectable via `-p profile-name`.
+Every `[name]` section becomes a profile selectable with `-p name`. Directives:
 
-Supported directives:
-* `description = <text>`: Summary shown in `--list-profiles`.
-* `mount = <ro|rw>:<path>`: Directory or file to bind-mount. Supports `~` and `$HOME` expansion. Repeatable.
-* `protect = <path>[/]`: Mounts a path read-only, even inside a read-write mount (e.g. `~/.claude/settings.json` inside `~/.claude`). Since a missing path could otherwise be created by the agent, an empty placeholder is created on the host first (a directory when the path ends with `/`, otherwise a file, `{}` for `.json`), only if its parent directory exists. Protected paths cannot be modified, renamed or replaced. Symlinks (e.g. files managed by a dotfiles repository) cannot be mounted read-only because bwrap follows them, and the link itself stays replaceable through its writable parent directory: their real target is protected instead, and after the sandbox exits the link is verified. If it was replaced or removed, the link is restored and any replacement is kept as `<path>.sandbox-replaced.<timestamp>` for inspection (a warning is shown). This check only runs when the session ends: while the sandbox runs, a replaced link is already visible to programs on the host (e.g. the same agent running outside the sandbox), and if the script is killed with `SIGKILL` the link is not verified at all. For files that must never change during a session, prefer protecting a real file or the directory that contains the link. Repeatable.
-* `tmpfs = <path>`: Mounts an empty, writable tmpfs over a directory, typically inside a read-only mount (e.g. `~/.cache/ms-playwright/b`, the registry where `@playwright/mcp` records running browsers). Writes stay in the sandbox's RAM and are discarded on exit, so nothing written there is ever read by tools on the host. A missing directory is created on the host first (only if its parent exists), since bwrap cannot create a mount point inside a read-only mount. Repeatable.
-* `env = <NAME|PATTERN_*>`: Environment variable(s) to forward from the host. Supports wildcards (e.g., `ANTIGRAVITY_*`). Repeatable.
-* `setenv = <NAME>=<VALUE>`: Fixed environment variable set inside the sandbox regardless of the host environment (e.g., `DISABLE_AUTOUPDATER=1`). Repeatable.
-* `dbus_auth = true|false`: Enables filtered D-Bus proxy access to Secret Service / Keyring tokens (`org.freedesktop.secrets`, `org.gnome.keyring`).
-* `dbus_notifications = true|false`: Enables filtered D-Bus proxy access to desktop notifications (`org.freedesktop.Notifications`).
-* `gui = true|false`: Exposes the host X11/Wayland display and clipboard, same as `--gui`.
-* `allow_userns = true|false`: Allows processes inside the sandbox to create nested user namespaces, same as `--allow-userns` (see the security warning below).
-* `terminal_env = true|false`: Forwards host terminal identification and color variables (`COLORTERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `TMUX`, `TMUX_PANE`, `VTE_VERSION`, `KONSOLE_VERSION`, `WT_SESSION`, `COLORFGBG`, `LS_COLORS`, `NO_COLOR`, `FORCE_COLOR`, `FORCE_HYPERLINK`, `CLICOLOR`, `CLICOLOR_FORCE`) and mounts `$TERMINFO` read-only when it points to a directory, same as `--terminal-env`. Tools inside the sandbox use them to pick color depth, color themes and hyperlink handling (Claude Code, for example, limits colors to 256 and wraps escape sequences differently when `TMUX` is set). The tmux server socket stays unreachable, since the sandbox has a private `/tmp` and symlink resolution never mounts `/tmp` or directories containing sockets; `KITTY_*` is never forwarded, since it refers to kitty remote control.
+* `description = <text>`: shown by `--list-profiles`.
+* `mount = <ro|rw>:<path>`: bind-mounts a file or directory. `~` and `$HOME` are expanded. Missing paths are skipped. Repeatable.
+* `protect = <path>[/]`: mounts a path read-only, even inside a read-write mount (e.g. `~/.claude/settings.json` inside `~/.claude`), so it cannot be modified, renamed or replaced. If the path does not exist but its parent does, an empty placeholder is created on the host first, so the agent cannot create it: a directory when the path ends with `/`, otherwise a file (`{}` for `.json`). Repeatable.
 
-The `dbus_*`, `gui`, `allow_userns` and `terminal_env` switches are enabled as soon as any active profile sets them to `true`; `false` (or omitting them) never disables a switch enabled by another profile or by a command-line flag.
+  Symlinks, such as files managed by a dotfiles repository, need special handling: bwrap follows them, and the link itself stays replaceable through its writable parent. So the link's target is protected instead, and the link is checked when the sandbox exits. If it was replaced or removed, it is restored and the replacement is kept as `<path>.sandbox-replaced.<timestamp>`, with a warning. During the session a replaced link is already visible to programs on the host, and nothing is checked if the script is killed with `SIGKILL`. For files that must never change mid-session, protect a real file or the directory containing the link.
+* `tmpfs = <path>`: mounts an empty, writable tmpfs over a directory, usually inside a read-only mount (e.g. `~/.cache/ms-playwright/b`, where `@playwright/mcp` records running browsers). Writes stay in RAM and are discarded on exit, so tools on the host never read them. A missing directory is created on the host first if its parent exists, since bwrap cannot create mount points inside a read-only mount. Repeatable.
+* `env = <NAME|PATTERN_*>`: forwards host environment variables. Wildcards are supported (`ANTIGRAVITY_*`). Repeatable.
+* `setenv = <NAME>=<VALUE>`: sets a fixed variable inside the sandbox (e.g. `DISABLE_AUTOUPDATER=1`). Repeatable.
+* `dbus_auth = true|false`: exposes the Secret Service / GNOME Keyring (`org.freedesktop.secrets`, `org.gnome.keyring`) through the filtered D-Bus proxy.
+* `dbus_notifications = true|false`: exposes desktop notifications (`org.freedesktop.Notifications`) through the filtered D-Bus proxy.
+* `gui = true|false`: same as `--gui`.
+* `allow_userns = true|false`: same as `--allow-userns`.
+* `terminal_env = true|false`: same as `--terminal-env`. Forwards terminal identification and color variables (`COLORTERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `TMUX`, `TMUX_PANE`, `VTE_VERSION`, `KONSOLE_VERSION`, `WT_SESSION`, `COLORFGBG`, `LS_COLORS`, `NO_COLOR`, `FORCE_COLOR`, `FORCE_HYPERLINK`, `CLICOLOR`, `CLICOLOR_FORCE`) and mounts `$TERMINFO` read-only when it is a directory. Tools use these to choose color depth, themes and hyperlink support (Claude Code, for instance, limits itself to 256 colors and wraps escape sequences differently when `TMUX` is set). The tmux socket itself stays unreachable: `/tmp` is private, and symlink resolution never mounts `/tmp` or directories containing sockets. `KITTY_*` is never forwarded, since it refers to kitty's remote control.
 
-**Example custom profile:**
+The switches (`dbus_*`, `gui`, `allow_userns`, `terminal_env`) are turned on if any active profile sets them to `true`. Setting `false`, or leaving them out, never turns off a switch enabled by another profile or a command-line flag.
+
+Example:
 ```ini
 [my-agent]
 description = Custom agent workspace and Hugging Face credentials
@@ -112,14 +108,13 @@ env = HF_TOKEN
 env = MY_AGENT_*
 ```
 
-Once saved, `my-agent` will instantly appear in `--list-profiles` and can be invoked with:
 ```bash
 ./bwrap-sandbox.sh -p dev-tools,my-agent -nf -- my-agent-cli
 ```
 
-### Profile Variants (`profile:variant`)
+### Profile variants (`profile:variant`)
 
-A section named `[profile:variant]` defines a variant of `[profile]`, selected with `-p profile:variant`. Variants inherit their base profile: the base section is applied first and the variant's directives are layered on top, so a variant only lists what changes (on conflicting mounts, the last registration wins, e.g. `rw` in the base becomes `ro` in the variant). `--list-profiles` shows variants grouped under their base profile.
+A `[profile:variant]` section defines a variant, selected with `-p profile:variant`. The base section is applied first and the variant's directives on top, so a variant only lists what changes. On conflicting mounts the later one wins, so a base `rw` mount can become `ro` in the variant. `--list-profiles` groups variants under their base profile.
 
 ```ini
 [my-agent:strict]
@@ -132,7 +127,7 @@ mount = ro:~/.cache/huggingface
 ./bwrap-sandbox.sh -p dev-tools,my-agent:strict -nf -- my-agent-cli
 ```
 
-The default template ships `standard` and `strict` variants for `claude` and `antigravity`. The `standard` variants additionally enable `gui` and `allow_userns` for headed browsers (see [Security Implications of `--gui`](#security-implications-of---gui) and [Security Implications of `--allow-userns`](#security-implications-of---allow-userns)), so `-p claude` and `-p claude:standard` are **not** equivalent. The `:` separator needs no shell quoting, unlike brackets, which zsh treats as glob patterns.
+The template ships `standard` and `strict` variants for `claude` and `antigravity`. `standard` adds `gui` and `allow_userns` for headed browsers, so `-p claude` and `-p claude:standard` are **not** the same (see the warnings on [`--gui`](#security-implications-of---gui) and [`--allow-userns`](#security-implications-of---allow-userns)). The `:` separator needs no quoting in zsh, unlike brackets.
 
 ---
 
@@ -166,253 +161,240 @@ Options:
   -h, --help               Show this help message
 ```
 
-The `--` delimiter separates script options from the command passed to the sandbox.
+Everything after `--` is the command to run inside the sandbox; without it, an interactive shell starts. The workspace cannot be `$HOME` or any directory containing it (such as `/home` or `/`), a system directory (`/usr`, `/etc`, `/run`, ...) or a shared root such as `/tmp`, `/opt` or `/mnt`.
 
-Use `--log-level debug` to inspect which profiles were applied and every mount with its `ro`/`rw` mode, or `--log-level warn`/`error` to silence informational reports.
-
-> [!WARNING]
-> #### Security Implications of `--gui`
-> Enabling GUI access (`-g, --gui`, or `gui = true` in a profile) forwards your host's X11 and/or Wayland display server and clipboard into the sandbox. This enables pasting images from the clipboard into terminal agents (e.g., `agy`), running headed browsers (`headless: false` in Playwright), and viewing graphical plots.
->
-> * **X11 does not isolate clients.** Any process inside the sandbox can log keystrokes sent to other X11 windows, capture their contents and inject synthetic input into them (XTest). If a host terminal runs under X11, injected keystrokes execute commands **outside the sandbox**, which amounts to a full sandbox escape. On a Wayland session the X11 socket belongs to Xwayland, so only applications running through Xwayland are exposed (list them with `xlsclients` on the host); native Wayland applications stay isolated.
-> * **Wayland isolates clients** from each other's input and screen contents. Screen capture requires the desktop portal, which the filtered D-Bus proxy does not expose.
-> * **Both protocols share the clipboard.** A sandboxed process can replace what you copied with a malicious command that runs when you paste it into a host terminal (clipboard poisoning), and it can read clipboard contents when it has focus.
-> * **Both protocols allow spoofed windows.** The sandbox can open a window imitating a password, keyring or sudo prompt and capture what you type into it.
->
-> Only enable `--gui` when you explicitly require graphical or clipboard capabilities (headless browsers do not need it), and check pasted commands before running them in a host terminal.
+`--log-level debug` lists the applied profiles and every mount with its mode; `warn` or `error` hides the informational output.
 
 > [!WARNING]
-> #### Security Implications of `--net`
-> Unrestricted network access (`-n, --net`) shares the host's network namespace instead of creating a new one. Besides the internet and your local network, the sandbox can then reach:
+> #### Security implications of `--gui`
+> `--gui` (or `gui = true`) forwards the host's X11 and/or Wayland display and the clipboard. This is what allows pasting images into a terminal agent, running headed browsers (Playwright with `headless: false`) and showing plots.
 >
-> * **Services listening on the host loopback** (`127.0.0.1`/`::1`), such as development servers, databases, the Docker API over TCP or a browser's remote debugging port, which usually assume that only local, trusted processes connect to them.
-> * **Abstract Unix sockets**, which belong to the network namespace rather than the filesystem, so the private `/tmp` does not hide them. For example, X11 listens on `@/tmp/.X11-unix/X0`: if the X server accepts local connections from your user without a cookie (common with Xwayland's `si:localuser`), the sandbox gets the X11 access described under `--gui` even without that flag.
+> * **X11 does not isolate clients.** Any process in the sandbox can read keystrokes sent to other X11 windows, capture their contents and inject input into them (XTest). If a host terminal runs under X11, injected keystrokes run commands **outside the sandbox**, which is a full escape. On a Wayland session the X11 socket belongs to Xwayland, so only applications running through Xwayland are exposed (`xlsclients` on the host lists them).
+> * **Wayland isolates clients** from each other's input and screen contents. Screen capture goes through the desktop portal, which the D-Bus proxy does not expose.
+> * **The clipboard is shared under both.** A sandboxed process can replace what you copied with a malicious command that runs when you paste it into a host terminal, and it can read the clipboard while it has focus.
+> * **Windows can be spoofed under both.** The sandbox can open a window that looks like a password, keyring or sudo prompt.
 >
-> Prefer `--net-filtered`, and use `--net` only for short, trusted commands (e.g. a build that downloads from unlisted repositories).
+> Enable `--gui` only when you need the display or the clipboard (headless browsers don't), and read pasted commands before running them on the host.
 
 > [!WARNING]
-> #### Security Implications of `--allow-userns`
-> By default the sandbox passes `--disable-userns` to bwrap, so processes inside it cannot create nested user namespaces. `--allow-userns` (or `allow_userns = true` in a profile) lifts this restriction, which is required by software that builds its own sandbox, such as Chrome/Chromium (otherwise it must run with `--no-sandbox`).
+> #### Security implications of `--net`
+> `--net` shares the host's network namespace instead of creating one. Besides the internet and your LAN, the sandbox can then reach:
 >
-> Creating a namespace does not by itself escape bwrap: nested namespaces stay confined to the sandbox. The risk is that an unprivileged user namespace grants capabilities (e.g. `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) over kernel subsystems normally reserved for root, such as netfilter/nf_tables, mounts and some filesystems. Many Linux local privilege escalation exploits (e.g. CVE-2024-1086 in nf_tables) are reachable only through this path. With nested user namespaces allowed, **any code running in the sandbox, including commands an agent runs because of a prompt injection, can reach that attack surface, and a working kernel exploit escapes the sandbox entirely and gains root on the host**.
+> * **Services on the host loopback** (`127.0.0.1`/`::1`): development servers, databases, the Docker API over TCP, a browser's remote debugging port. These usually assume only trusted local processes connect.
+> * **Abstract Unix sockets**, which belong to the network namespace rather than the filesystem, so the private `/tmp` does not hide them. X11, for example, listens on `@/tmp/.X11-unix/X0`; if the X server accepts local connections from your user without a cookie (common with Xwayland's `si:localuser`), the sandbox gets the X11 access described under `--gui` without that flag.
 >
-> Trade-off for headed browsers: keeping `--disable-userns` and running the browser with `--no-sandbox` (e.g. `@playwright/mcp --no-sandbox`) exposes only what the bwrap sandbox already exposes to a compromised page, while `--allow-userns` keeps the browser's sandbox but weakens the outer boundary. Prefer `--no-sandbox` when the browser only visits trusted sites, keep the host kernel up to date, and enable `--allow-userns` only for sessions that need it. On Ubuntu, AppArmor (`kernel.apparmor_restrict_unprivileged_userns`) may still block nested namespaces.
+> Prefer `--net-filtered`. Keep `--net` for short, trusted commands, such as a build that downloads from repositories not on the whitelist.
+
+> [!WARNING]
+> #### Security implications of `--allow-userns`
+> By default the sandbox passes `--disable-userns` to bwrap, so nothing inside it can create nested user namespaces. `--allow-userns` (or `allow_userns = true`) removes that restriction, which software that builds its own sandbox needs, such as Chrome/Chromium (otherwise it must run with `--no-sandbox`).
+>
+> A nested namespace does not escape bwrap by itself. The problem is that an unprivileged user namespace grants capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) over kernel subsystems normally reserved for root, such as nf_tables, mounts and some filesystems, and many local privilege escalation exploits (e.g. CVE-2024-1086 in nf_tables) are only reachable this way. With this option, **any code in the sandbox, including commands an agent runs because of a prompt injection, can reach that attack surface, and a working kernel exploit gives root on the host**.
+>
+> For headed browsers, the trade-off is: keeping `--disable-userns` and running the browser with `--no-sandbox` (e.g. `@playwright/mcp --no-sandbox`) leaves a compromised page with only what bwrap already allows, while `--allow-userns` keeps the browser's sandbox but weakens the outer one. Prefer `--no-sandbox` when the browser only visits trusted sites, keep the kernel updated, and enable `--allow-userns` only for sessions that need it. On Ubuntu, AppArmor (`kernel.apparmor_restrict_unprivileged_userns`) may still block nested namespaces.
 
 ---
 
 ## Examples
 
-### 1. Interactive Inspection (Offline)
+### 1. Offline shell
 
-Launch a clean subshell in the current project directory with no network access:
+A shell in the current directory with no network:
 
 ```bash
 ./bwrap-sandbox.sh
-
 ```
 
-### 2. Run Antigravity CLI with Domain-Filtered Internet (Recommended)
+### 2. Antigravity CLI with filtered network
 
-Run Antigravity with your host compilers, persistent credentials, and network strictly constrained to whitelisted APIs (Google, Gemini, Anthropic, GitHub, NPM, PyPI, etc.):
+Host toolchains, Antigravity's credentials and state, and network limited to the whitelist:
 
 ```bash
 ./bwrap-sandbox.sh -p dev-tools,antigravity -nf -- agy
-
 ```
 
-### 3. Run Claude Code with Domain-Filtered Internet
-
-Run Claude Code with host toolchains, persistent sessions/credentials, and network constrained to whitelisted APIs:
+### 3. Claude Code with filtered network
 
 ```bash
 ./bwrap-sandbox.sh -p dev-tools,claude -nf -- claude --dangerously-skip-permissions
 
-# Strict variant: hooks, settings, skills, agents, commands, plugins, instructions and binary are read-only
+# Strict variant: hooks, settings, skills, agents, commands, plugins, instructions and the binary are read-only
 ./bwrap-sandbox.sh -p dev-tools,claude:strict -nf -- claude --dangerously-skip-permissions
 ```
 
-Notes for the `claude` profile:
-* **Headed browsers (`claude:standard`):** The `standard` variant enables `gui` and `allow_userns`, so Playwright can open a visible Chrome window with Chrome's own sandbox. Use the base `claude` profile when you don't need a browser, to keep `--disable-userns` and the display closed.
-* **Notifications:** The profile enables `dbus_notifications`, so hooks can send desktop notifications (e.g. `notify-send` from a `Stop` hook). Only `org.freedesktop.Notifications` is reachable through the filtered D-Bus proxy; keyring and systemd access stay blocked.
-* **Authentication:** On Linux, Claude Code stores OAuth credentials in `~/.claude/.credentials.json`, which is shared with the host, so no keyring/D-Bus access is required. If you are already logged in on the host, the sandbox reuses that session (token refreshes go through `platform.claude.com`, included in the default whitelist). To log in from inside the sandbox, run `/login`: the browser cannot be launched from the sandbox, so open the printed URL on the host and paste the authorization code back into the terminal. API key users can export `ANTHROPIC_API_KEY` instead (all `ANTHROPIC_*` variables and `CLAUDE_CODE_OAUTH_TOKEN` are forwarded).
-* **Updates:** The Claude Code installation (`~/.local/share/claude`) is mounted read-write for convenience, so Claude Code can update itself. This also means the agent can modify the executable you run on the host. The `strict` variant mounts it read-only and disables auto-updates (`DISABLE_AUTOUPDATER=1`); run `claude update` on the host instead.
-* **Strict variant (`claude:strict`):** protects the files an agent could use to persist or execute code: `~/.claude/settings.json` (hooks, statusline, permissions), `CLAUDE.md`, `skills/`, `agents/`, `commands/`, `output-styles/`, `plugins/`, `hooks/` (common location for hook scripts) and `chrome/` (the Claude in Chrome native messaging host, executed by the browser on the host). Sessions, history and OAuth credentials stay writable. Trade-offs: `/config`, `/model` and similar commands cannot persist settings, and plugins cannot be installed or synced. Not covered: MCP servers in `~/.claude.json` (Claude Code must write this file) and project-level configuration in the workspace (`.claude/`, `.mcp.json`), which shows up in `git diff`.
-* **Strict variant (`antigravity:strict`):** protects `~/.gemini/config/` (hooks, MCP config, skills, scripts, plugins; per-project state stays writable), the Antigravity CLI `settings.json`, global instructions (`GEMINI.md`, `AGENTS.md`), Antigravity authentication config (`~/.config/antigravity/`), executables (`~/.gemini/bin/`, `agentapi` helpers, `~/.cache/antigravity/bin/`), and the IDE's extensions, user settings, keybindings, and wrappers (`~/.antigravity/{extensions,bin}/`, `argv.json`, `~/.antigravity-ide/`, `~/.config/Antigravity/`, `~/.config/Antigravity IDE/`). In-sandbox updates will fail; update from the host. If `GEMINI.md`/`AGENTS.md` are symlinks (e.g. to a dotfiles repository), their targets are read-only and the links are verified and restored on exit (see `protect`).
+Notes on the `claude` profile:
+* **Authentication:** on Linux, Claude Code keeps OAuth credentials in `~/.claude/.credentials.json`, which is shared with the host, so no keyring access is needed. If you are logged in on the host, the sandbox reuses that session (token refreshes go to `platform.claude.com`, which is in the default whitelist). To log in from inside, run `/login`, open the printed URL on the host and paste the code back. With an API key, export `ANTHROPIC_API_KEY` instead; all `ANTHROPIC_*` variables and `CLAUDE_CODE_OAUTH_TOKEN` are forwarded.
+* **Updates:** `~/.local/share/claude` is mounted read-write so Claude Code can update itself, which also means the agent can modify the binary you run on the host. `claude:strict` mounts it read-only and sets `DISABLE_AUTOUPDATER=1`; update with `claude update` on the host.
+* **Notifications:** `dbus_notifications` is on, so hooks can call `notify-send`. Only `org.freedesktop.Notifications` is reachable; keyring and systemd are not.
+* **Headed browsers (`claude:standard`):** enables `gui` and `allow_userns` so Playwright can open a visible Chrome with Chrome's own sandbox. Use the base profile when you don't need that.
+* **`claude:strict`** protects the files an agent could use to persist or run code: `~/.claude/settings.json` (hooks, statusline, permissions), `CLAUDE.md`, `skills/`, `agents/`, `commands/`, `output-styles/`, `plugins/`, `hooks/` and `chrome/` (the Claude in Chrome native messaging host, which the browser runs on the host). Sessions, history and credentials stay writable. As a consequence, `/config`, `/model` and similar commands cannot save settings, and plugins cannot be installed or synced. Not covered: MCP servers in `~/.claude.json` (Claude Code has to write that file) and project configuration in the workspace (`.claude/`, `.mcp.json`), which shows up in `git diff`.
+
+Notes on `antigravity:strict`: it protects `~/.gemini/config/` (hooks, MCP config, skills, scripts, plugins; per-project state stays writable), the CLI's `settings.json`, global instructions (`GEMINI.md`, `AGENTS.md`), the authentication config (`~/.config/antigravity/`), executables (`~/.gemini/bin/`, the `agentapi` helpers, `~/.cache/antigravity/bin/`), and the IDE's extensions, settings, keybindings and wrappers (`~/.antigravity/{extensions,bin}/`, `argv.json`, `~/.antigravity-ide/`, `~/.config/Antigravity/`, `~/.config/Antigravity IDE/`). Updates from inside the sandbox fail; update on the host. If `GEMINI.md` or `AGENTS.md` are symlinks, their targets are protected and the links are checked on exit (see `protect`).
 
 > [!WARNING]
-> **Agent self-configuration attacks:** Any profile that mounts an agent's configuration directory read-write (e.g. `~/.claude`, `~/.claude.json`, `~/.gemini`) lets the agent, or a prompt injection steering it, rewrite its own configuration. Hooks, MCP servers, plugins, skills and instruction files (`CLAUDE.md`) can all execute commands or alter the agent's behavior, which enables two attack paths:
-> * **Host execution:** if you ever run the agent **outside** the sandbox, a hook or MCP server planted from inside it runs on your host with full user privileges (SSH keys, browser sessions, shell profiles).
-> * **Cross-project persistence:** because the configuration directory is shared, a payload planted while working on project A also runs in later sandboxed sessions for project B, breaking the isolation between workspaces.
+> **Agents can rewrite their own configuration.** A profile that mounts an agent's configuration read-write (`~/.claude`, `~/.claude.json`, `~/.gemini`) lets the agent, or a prompt injection steering it, change that configuration. Hooks, MCP servers, plugins, skills and instruction files can all run commands or change the agent's behavior. That opens two paths:
+> * **Code execution on the host:** if you ever run the agent **outside** the sandbox, a hook or MCP server planted from inside runs with your full user privileges.
+> * **Persistence across projects:** the configuration is shared, so something planted while working on project A also runs in later sandboxed sessions for project B.
 >
-> The same applies to project-level configuration inside the workspace (e.g. `<project>/.claude/settings.json`). Mitigations: run the agent only through the sandbox, review configuration changes periodically (e.g. keep the config directory under Git and inspect `git diff`), use the `strict` profile variants (or `protect` directives in your own profiles), or point the sandbox at a dedicated configuration directory (e.g. `CLAUDE_CONFIG_DIR`) that is separate from the one your host agent uses.
+> Project configuration inside the workspace (e.g. `<project>/.claude/settings.json`) has the same problem. Mitigations: run the agent only through the sandbox, keep the configuration directory under Git and review `git diff` from time to time, use the `strict` variants (or `protect` in your own profiles), or give the sandbox its own configuration directory (e.g. `CLAUDE_CONFIG_DIR`).
 
-### 4. Run Claude Code with Custom Domain Whitelist
-
-Run Claude Code with host toolchains and a custom domain whitelist file:
+### 4. Custom domain whitelist
 
 ```bash
 ./bwrap-sandbox.sh -p dev-tools,claude -nf -w ./my-domains.txt -- claude
 ```
 
-### 5. Run Unrestricted Build / Download Commands
+### 5. Unrestricted network for a build
 
-When downloading from unwhitelisted package repositories or running unrestricted commands:
+For downloads from repositories that are not on the whitelist:
 
 ```bash
 ./bwrap-sandbox.sh -p dev-tools --net -- cargo build
 ```
 
-### 6. Run Antigravity CLI with GUI & Clipboard Support
+### 6. Antigravity CLI with display and clipboard
 
-Run Antigravity with domain-filtered internet and GUI display enabled (allowing pasting clipboard images directly into the CLI via `Ctrl+V`, headed browser tests, etc.):
+Lets you paste images into the CLI with `Ctrl+V` and run headed browsers:
 
 ```bash
 ./bwrap-sandbox.sh -p dev-tools,antigravity -nf -g -- agy
 ```
 
-### 7. Resolve Workspace Symlinks Pointing Outside the Project
+### 7. Workspace symlinks that point outside the project
 
-Only the workspace is mounted, so symlinks inside the project that point **outside** of it (shared libraries, `npm link` / `pip install -e` packages, files stored in another repository) are broken inside the sandbox. Symlinks pointing to other locations inside the project always work. `--resolve-symlinks` scans the workspace and mounts each external target:
+Since only the workspace is mounted, symlinks pointing **outside** it (shared libraries, `npm link` or `pip install -e` packages, files in another repository) are broken inside the sandbox. Links to other places inside the project work normally. `--resolve-symlinks` scans the workspace and mounts each external target:
 
 ```bash
-# Read-only (default, same as --resolve-symlinks=ro or --resolve-symlinks=read)
+# Read-only (default; same as --resolve-symlinks=ro or =read)
 ./bwrap-sandbox.sh -p dev-tools,claude -nf --resolve-symlinks -- claude
 
-# Read-write (same as --resolve-symlinks=write): the agent may also modify the symlink targets
+# Read-write (same as =write): the agent can also modify the targets
 ./bwrap-sandbox.sh -p dev-tools,claude -nf --resolve-symlinks=rw -- claude
 ```
 
-Every mounted or refused symlink is reported on startup (`[+] Resolved workspace symlink ...` / `Warning: Skipping workspace symlink ...`). Rules applied:
+Each mounted or refused link is reported at startup (`[+] Resolved workspace symlink ...` / `Warning: Skipping workspace symlink ...`). The rules:
 
-* **Blocklist (`symlink-blocklist.txt`):** host paths that are never mounted. The default template covers credentials and secrets (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, `~/.config/gh`, `~/.netrc`, `~/.npmrc`, keyrings, agent configs such as `~/.claude` and `~/.gemini`), browser profiles, shell startup files and histories (`~/.zshrc`, `~/.bashrc`, ...), `~/.gitconfig`, system paths (`/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/root`, `/boot`) and shared temporary directories that hold host IPC sockets (`/tmp`, `/var/tmp`). Entries prefixed with `rw:` are only refused in `rw` mode; the template uses it for host-executed locations (`~/.local/bin`, `~/.config/systemd`, `~/.config/autostart`) and the `bwrap-sandbox` installation directory itself (`$SANDBOX_DIR`). A blocked path also blocks every directory **containing** it (e.g. a link to `~` or `/`), and entries that are themselves symlinks (e.g. `~/.zshrc` managed by a dotfiles repository) also block their real location. If the blocklist file is missing, `--resolve-symlinks` refuses to run.
-* **Always refused (built-in):** sockets, devices and FIFOs, and directories containing any of them at any depth (a socket stays connectable through a read-only mount, e.g. a tmux, D-Bus, Docker or SSH agent socket); targets containing the workspace (e.g. `link -> ..`), which would expose sibling projects; and targets containing a profile mount, which would override its `ro`/`rw` mode.
-* **Skipped:** targets already visible in the sandbox (system directories or profile mounts keep the mode set by the profile), broken symlinks and anything inside `.git`.
-* Symlinks are resolved once at startup and only one level deep: symlinks created later by the agent, or nested inside a mounted target, are not resolved.
+* **Blocklist (`symlink-blocklist.txt`):** host paths that are never mounted. The template covers credentials and secrets (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, `~/.config/gh`, `~/.netrc`, `~/.npmrc`, keyrings, agent configs such as `~/.claude` and `~/.gemini`), browser profiles, shell startup files and histories, `~/.gitconfig`, system paths (`/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/root`, `/boot`) and shared temporary directories holding host IPC sockets (`/tmp`, `/var/tmp`). Entries prefixed with `rw:` are refused only in `rw` mode; the template uses that for locations the host executes from (`~/.local/bin`, `~/.config/systemd`, `~/.config/autostart`) and for the `bwrap-sandbox` directory itself (`$SANDBOX_DIR`). A blocked path also blocks every directory that **contains** it (a link to `~` or `/`), and entries that are symlinks also block their real location. Without the blocklist file, `--resolve-symlinks` refuses to run.
+* **Always refused:** sockets, devices and FIFOs, and directories containing any of them at any depth (a socket stays connectable through a read-only mount); targets containing the workspace (e.g. `link -> ..`), which would expose sibling projects; and targets containing a profile mount, which would override its mode.
+* **Skipped:** targets already visible in the sandbox (they keep the mode the profile set), broken links and anything inside `.git`.
+* Links are resolved once, at startup, and one level deep. Links the agent creates later, or links inside a mounted target, are not resolved.
 
 > [!WARNING]
-> A cloned repository can ship hostile symlinks (e.g. `keys -> ~/.ssh`). The blocklist is best-effort, so review the startup report and only use `--resolve-symlinks` on projects you trust. Prefer the default `ro` mode; `rw` lets the agent modify files outside the workspace that your host may later execute or trust (scripts, build files, other repositories). For a permanent, explicit setup, a `mount = ro:<path>` entry in a custom profile is the safer alternative.
+> A cloned repository can ship hostile symlinks (e.g. `keys -> ~/.ssh`). The blocklist is best-effort: read the startup report and use `--resolve-symlinks` only on projects you trust. Prefer `ro`; `rw` lets the agent modify files outside the workspace that the host may later run or trust. For a permanent setup, an explicit `mount = ro:<path>` in a profile is safer.
 
 ---
 
-## Profiles & Environment Isolation
+## Bundled profiles
 
-Profiles govern which host paths, IPC mechanisms, and environment variables are exposed to the sandbox. Multiple profiles can be combined; in case of path permission conflicts, the last profile evaluated wins.
-
-| Profile | Mounts / Permissions | Forwarded Environment Variables | Purpose |
+| Profile | Mounts / permissions | Forwarded variables | Purpose |
 | --- | --- | --- | --- |
-| `dev-tools` | `~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `~/.rustup`, `~/.fnm`, `~/.volta`, `~/.bun/bin`, `~/go/bin`, `~/.local/share/mise`, `~/.config/mise`, `~/.local/share/uv` **[RO]** | *(None)* | Exposes host toolchains to compile and test without modifying binaries. |
-| `antigravity` | `~/.antigravity` **[RW]**<br>`~/.antigravity-ide` **[RW]**<br>`~/.gemini` **[RW]**<br>`~/.config/antigravity` **[RW]**<br>`~/.config/Antigravity` **[RW]**<br>`~/.config/Antigravity IDE` **[RW]**<br>`~/.cache/antigravity` **[RW]**<br>`~/.local/bin/agy` **[RO]**<br>`~/.cache/ms-playwright-go` **[RO]**<br>`~/.cache/ms-playwright` **[RO]**<br>`~/.cache/ms-playwright/b` **[tmpfs]**<br>`/opt/google/chrome` **[RO]**<br>`xdg-dbus-proxy` socket | `GEMINI_*`<br>`ANTIGRAVITY_*`<br>`GOOGLE_API_KEY`<br>`GOOGLE_APPLICATION_CREDENTIALS`<br>Terminal variables (`terminal_env`) | Preserves Antigravity/Gemini state, IDE/app configurations, embedded cache tools, and uses filtered D-Bus for Google OAuth / Keyring; matches host hyperlink and color rendering. |
-| `antigravity:standard` | Same as `antigravity`, plus X11/Wayland display and clipboard (`gui`) and nested user namespaces (`allow_userns`) | Same as `antigravity` | Headed browsers (Playwright `headless: false`) with Chrome's own sandbox. Weakens isolation (see `--gui` and `--allow-userns`). |
-| `antigravity:strict` | Same as `antigravity`, plus **[RO]**: `~/.gemini/config/` (except `projects/`), `GEMINI.md`, `AGENTS.md`, CLI `settings.json`, `~/.config/antigravity/`, `~/.gemini/bin/`, `agentapi` helpers, `~/.cache/antigravity/bin/`, IDE extensions, settings, keybindings and wrappers (`~/.antigravity/`, `~/.antigravity-ide/`, `~/.config/Antigravity/`, `~/.config/Antigravity IDE/`) | Same as `antigravity` | Blocks hook, MCP, skill, IDE setting and binary tampering (self-configuration attacks). |
-| `claude` | `~/.claude` **[RW]**<br>`~/.claude.json` **[RW]**<br>`~/.local/state/claude` **[RW]**<br>`~/.local/share/claude` **[RW]**<br>`~/.local/bin/claude` **[RO]**<br>`~/.cache/ms-playwright` **[RO]**<br>`~/.cache/ms-playwright/b` **[tmpfs]**<br>`/opt/google/chrome` **[RO]**<br>`xdg-dbus-proxy` socket (notifications only) | `ANTHROPIC_*`<br>`CLAUDE_CODE_OAUTH_TOKEN`<br>Terminal variables (`terminal_env`) | Preserves Claude Code OAuth credentials, session history and installation; allows desktop notifications from hooks; matches host hyperlink and color rendering. |
-| `claude:standard` | Same as `claude`, plus X11/Wayland display and clipboard (`gui`) and nested user namespaces (`allow_userns`) | Same as `claude` | Headed browsers (Playwright `headless: false`) with Chrome's own sandbox. Weakens isolation (see `--gui` and `--allow-userns`). |
-| `claude:strict` | Same as `claude`, plus **[RO]**: `~/.claude/{settings.json,CLAUDE.md}`, `~/.claude/{skills,agents,commands,output-styles,plugins,hooks,chrome}/`, `~/.local/share/claude` | Same as `claude`<br>*(sets `DISABLE_AUTOUPDATER=1`)* | Blocks hook, skill, plugin and binary tampering (self-configuration attacks). |
-| `openai` | *(None)* | `OPENAI_API_KEY` | Forwards OpenAI API credentials to tools that require them. |
-| `deepseek` | *(None)* | `DEEPSEEK_API_KEY` | Forwards DeepSeek API credentials. |
-| `mistral` | *(None)* | `MISTRAL_API_KEY` | Forwards Mistral API credentials. |
-| `groq` | *(None)* | `GROQ_API_KEY` | Forwards Groq API credentials. |
-| `none` | *(None)* | *(None)* | Pure isolation; no host configs, credentials, or toolchains escape RAM. |
+| `dev-tools` | `~/.local/bin`, `~/.cargo/bin`, `~/.nvm`, `~/.pyenv`, `~/.asdf`, `~/.rustup`, `~/.fnm`, `~/.volta`, `~/.bun/bin`, `~/go/bin`, `~/.local/share/mise`, `~/.config/mise`, `~/.local/share/uv` **[RO]** | *(none)* | Host toolchains for building and testing, without letting the agent modify them. |
+| `antigravity` | `~/.antigravity` **[RW]**<br>`~/.antigravity-ide` **[RW]**<br>`~/.gemini` **[RW]**<br>`~/.config/antigravity` **[RW]**<br>`~/.config/Antigravity` **[RW]**<br>`~/.config/Antigravity IDE` **[RW]**<br>`~/.cache/antigravity` **[RW]**<br>`~/.local/bin/agy` **[RO]**<br>`~/.cache/ms-playwright-go` **[RO]**<br>`~/.cache/ms-playwright` **[RO]**<br>`~/.cache/ms-playwright/b` **[tmpfs]**<br>`/opt/google/chrome` **[RO]**<br>D-Bus proxy (keyring and notifications) | `GEMINI_*`<br>`ANTIGRAVITY_*`<br>`GOOGLE_API_KEY`<br>`GOOGLE_APPLICATION_CREDENTIALS`<br>Terminal variables (`terminal_env`) | Antigravity CLI and IDE state, Google OAuth through the keyring, notifications. |
+| `antigravity:standard` | `antigravity` plus display and clipboard (`gui`) and nested user namespaces (`allow_userns`) | Same as `antigravity` | Headed browsers with Chrome's own sandbox. Weakens isolation. |
+| `antigravity:strict` | `antigravity` plus **[RO]**: `~/.gemini/config/` (except `projects/`), `GEMINI.md`, `AGENTS.md`, CLI `settings.json`, `~/.config/antigravity/`, `~/.gemini/bin/`, `agentapi` helpers, `~/.cache/antigravity/bin/`, IDE extensions, settings, keybindings and wrappers | Same as `antigravity` | Blocks tampering with hooks, MCP config, skills, IDE settings and binaries. |
+| `claude` | `~/.claude` **[RW]**<br>`~/.claude.json` **[RW]**<br>`~/.local/state/claude` **[RW]**<br>`~/.local/share/claude` **[RW]**<br>`~/.local/bin/claude` **[RO]**<br>`~/.cache/ms-playwright` **[RO]**<br>`~/.cache/ms-playwright/b` **[tmpfs]**<br>`/opt/google/chrome` **[RO]**<br>D-Bus proxy (notifications only) | `ANTHROPIC_*`<br>`CLAUDE_CODE_OAUTH_TOKEN`<br>Terminal variables (`terminal_env`) | Claude Code credentials, sessions and installation; notifications from hooks. |
+| `claude:standard` | `claude` plus display and clipboard (`gui`) and nested user namespaces (`allow_userns`) | Same as `claude` | Headed browsers with Chrome's own sandbox. Weakens isolation. |
+| `claude:strict` | `claude` plus **[RO]**: `~/.claude/{settings.json,CLAUDE.md}`, `~/.claude/{skills,agents,commands,output-styles,plugins,hooks,chrome}/`, `~/.local/share/claude` | Same as `claude`<br>*(sets `DISABLE_AUTOUPDATER=1`)* | Blocks tampering with hooks, skills, plugins and the binary. |
+| `openai` | *(none)* | `OPENAI_API_KEY` | OpenAI credentials. |
+| `deepseek` | *(none)* | `DEEPSEEK_API_KEY` | DeepSeek credentials. |
+| `mistral` | *(none)* | `MISTRAL_API_KEY` | Mistral credentials. |
+| `groq` | *(none)* | `GROQ_API_KEY` | Groq credentials. |
+| `none` | *(none)* | *(none)* | No host configuration, credentials or toolchains. This is the default. |
 
-### Per-Profile Environment Variable Isolation
-
-To prevent credential leakage and uphold the principle of least privilege, environment variables are passed into the sandbox **only** if they are explicitly matched by an `env` directive in one of the active profiles:
-
-* Running `./bwrap-sandbox.sh -p dev-tools -- cargo build` passes **zero** API keys into the sandbox.
-* Running `./bwrap-sandbox.sh -p claude -- claude` passes only `ANTHROPIC_*` and `CLAUDE_CODE_OAUTH_TOKEN`, keeping your other credentials hidden.
-* Running `./bwrap-sandbox.sh -p claude,openai -- my-script` passes both the Anthropic variables and `OPENAI_API_KEY`.
-* Profiles support wildcards (`env = ANTIGRAVITY_*`), forwarding all matching exported host variables.
-
-### Git Identity Inside the Sandbox
-
-`~/.gitconfig` is hidden like the rest of `$HOME`, so `git commit` fails inside the sandbox with `Author identity unknown`. Two options:
-
-* **Identity only (least exposure):** set it per profile with `setenv = GIT_AUTHOR_NAME=...`, `GIT_AUTHOR_EMAIL=...`, `GIT_COMMITTER_NAME=...` and `GIT_COMMITTER_EMAIL=...`.
-* **Whole file:** uncomment `mount = ro:~/.gitconfig` in the `claude` or `antigravity` profile. It is read-only, so the agent cannot plant aliases, pagers or credential helpers that would later run on the host (the sandbox also keeps `core.hooksPath=/dev/null` over it), but the agent can read everything in it. Check it first for tokens in URLs, `http.extraHeader`, `credential.helper` or `include.path` entries, e.g. `grep -nE 'token|password|extraheader|https?://[^/ ]*@|helper|include' ~/.gitconfig`.
-
-Inspect current profiles and descriptions:
+List the profiles in your local configuration with:
 ```bash
 ./bwrap-sandbox.sh --list-profiles
 ```
 
+### Environment variables
+
+A host variable reaches the sandbox only if an `env` directive in an active profile matches it:
+
+* `-p dev-tools -- cargo build`: no API keys.
+* `-p claude -- claude`: only `ANTHROPIC_*` and `CLAUDE_CODE_OAUTH_TOKEN`.
+* `-p claude,openai -- my-script`: the Anthropic variables plus `OPENAI_API_KEY`.
+
+### Git identity
+
+`~/.gitconfig` is hidden along with the rest of `$HOME`, so `git commit` inside the sandbox fails with `Author identity unknown`. Two ways around it:
+
+* **Identity only (least exposure):** set `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` with `setenv` in a profile.
+* **The whole file:** uncomment `mount = ro:~/.gitconfig` in the `claude` or `antigravity` profile. Being read-only, the agent cannot add aliases, pagers or credential helpers that would later run on the host (and `core.hooksPath=/dev/null` is still forced inside the sandbox), but it can read everything in the file. Check it first for tokens in URLs, `http.extraHeader`, `credential.helper` or `include.path`, e.g. `grep -nE 'token|password|extraheader|https?://[^/ ]*@|helper|include' ~/.gitconfig`.
+
 ---
 
-## Security Architecture
+## How it works
 
 ```
 +-------------------------------------------------------------------------+
-| HOST SYSTEM                                                             |
-|  ~/.ssh, ~/.aws, /etc/shadow             (Completely Hidden)            |
-|  /usr, /bin, ~/.cargo/bin                (Mounted Read-Only)            |
-|  /run/user/$UID/bus                      (Protected by xdg-dbus-proxy)  |
-|  /tmp/bwrap-net-XXXXXX/proxy.sock        (Unix Socket Domain Filter)    |
+| HOST                                                                    |
+|  ~/.ssh, ~/.aws, /etc/shadow             (not mounted)                  |
+|  /usr, ~/.cargo/bin                      (mounted read-only)            |
+|  /run/user/$UID/bus                      (behind xdg-dbus-proxy)        |
+|  /tmp/bwrap-net-XXXXXX/proxy.sock        (behind net-proxy.py)          |
 +-------------------------------------------------------------------------+
        |                                             |
-       | (Filtered D-Bus Socket)                     | (Filtered Network Socket)
+       | filtered D-Bus socket                       | Unix socket
        v                                             v
 +------------------------------------+   +--------------------------------+
-| xdg-dbus-proxy                     |   | net-proxy.py (Host Mode)       |
-|  ALLOW: org.freedesktop.secrets    |   |  ALLOW: Whitelisted Domains    |
-|  ALLOW: org.gnome.keyring          |   |  BLOCK: All other domains(403) |
-|  BLOCK: org.freedesktop.systemd1   |   +--------------------------------+
-|  BLOCK: Everything else            |                   |
-+------------------------------------+                   | (Bind-Mount)
-                   |                                     v
-                   |          +--------------------------------------------+
-                   +=========>| BWRAP SANDBOX (--unshare-net)              |
-                              |  [Filesystem]                              |
-                              |   ├── /          (Read-Only)               |
-                              |   ├── /tmp       (Ephemeral RAM tmpfs)     |
-                              |   ├── $HOME      (RAM tmpfs)               |
-                              |   └── /workspace (Mounted Read-Write)      |
-                              |         └── .git/{hooks,config} (Read-Only)|
-                              |  [Network Relay]                           |
-                              |   └── 127.0.0.1:18080 (socat/python relay) |
-                              |  [Isolation]                               |
-                              |   ├── Kernel Net: Isolated (unshared)      |
-                              |   ├── PID 1     : Private PID namespace    |
-                              |   └── Session   : Detached (No TIOCSTI)    |
-                              +--------------------------------------------+
+| xdg-dbus-proxy                     |   | net-proxy.py (on the host)     |
+|  ALLOW: org.freedesktop.secrets    |   |  ALLOW: whitelisted domains    |
+|  ALLOW: org.gnome.keyring          |   |  DENY:  everything else (403)  |
+|  ALLOW: org.freedesktop.           |   +--------------------------------+
+|         Notifications              |                   |
+|  (each only if the profile asks)   |                   | bind mount
+|  DENY:  everything else            |                   v
++------------------------------------+   +--------------------------------+
+                   |                     | BWRAP SANDBOX                  |
+                   +====================>|  Filesystem                    |
+                                         |   /usr, parts of /etc  (ro)    |
+                                         |   /tmp, $HOME          (tmpfs) |
+                                         |   <workspace>          (rw)    |
+                                         |     .git/{hooks,config} (ro)   |
+                                         |  Network                       |
+                                         |   own namespace, no routes     |
+                                         |   127.0.0.1:18080 relay        |
+                                         |  Processes                     |
+                                         |   private PID namespace        |
+                                         |   new session (no TIOCSTI)     |
+                                         +--------------------------------+
 ```
 
-### Defense Mechanisms in Detail
+### Details
 
-* **Strict Domain & Port Whitelisting (`-nf`):** The sandbox stays in an unshared network namespace (`--unshare-net`). Outbound HTTP/HTTPS traffic is routed strictly through an internal loopback relay (`127.0.0.1:18080`) over a mounted Unix domain socket to `net-proxy.py` on the host. Unlisted domains or unlisted ports are rejected with `403 Forbidden`. Untrusted processes cannot bypass the filter via raw TCP/UDP sockets (which yield `Network is unreachable`), nor can they probe host ports (`127.0.0.1`) unless granular access is explicitly declared in `allowed-domains.txt` (e.g. `localhost:11434` for Ollama, `127.0.0.1:8000,8080`, or port ranges like `3000-3010`). The filter only sees the host and port a client asks for: traffic inside an allowed `CONNECT` tunnel (TLS SNI, the inner `Host` header, or any other protocol on an allowed port) is not inspected, so a whitelisted CDN or shared hosting platform can relay requests to other sites it serves (domain fronting). Whitelist specific hostnames rather than broad wildcards on shared platforms. Request heads must arrive within 30 seconds and with at most 100 header lines, and upstream connections time out after 15 seconds; established tunnels have no idle timeout.
-* **Git Metadata Protection:** Git on the host runs hooks and config-defined commands (`core.fsmonitor`, `core.pager`, `diff.external`, `credential.helper`, ...), so a poisoned repository would execute code outside the sandbox the next time you run `git status`. For the workspace repository, its linked worktrees (`.git/worktrees/*`) and its submodules (`.git/modules/**`), `hooks/`, `config`, `config.worktree`, `commondir` and `gitdir` are mounted read-only, and every git directory is mounted on itself so it cannot be renamed or replaced. Objects, refs, the index and logs stay writable, so the agent can commit, branch and fetch. Since `<gitdir>/commondir` would redirect Git to a config and hooks elsewhere, a no-op placeholder containing `./` is created in each repository (it is left in place; Git only reports the common directory as an absolute path, e.g. in `git rev-parse --git-common-dir`), and the sandbox refuses to start if one points anywhere else. Not covered: a repository the agent creates during the session (a warning is shown on exit) and nested repositories the agent creates inside the workspace, so only run Git on the host in directories you expect to be repositories.
-* **Git SSH Trap Mitigation:** Because SSH (port 22) cannot pass through an HTTP proxy, `GIT_CONFIG_PARAMETERS` automatically rewrites `git@github.com:` and `git@gitlab.com:` to `https://` URLs so `git clone` and `git fetch` seamlessly traverse the filtering proxy without developer intervention.
-* **D-Bus Host Escape Neutralization & Fine-Grained Permissions:** Passing raw host D-Bus sockets into a sandbox allows attackers to instruct `systemd --user` to run commands outside all namespaces. Profiles requiring D-Bus spawn an isolated `xdg-dbus-proxy` filtering out all calls except explicitly permitted bus names, while completely blocking `org.freedesktop.systemd1` and other host APIs. Permissions are decoupled for least privilege:
-  * `dbus_auth = true`: Filters and exposes `org.freedesktop.secrets` and `org.gnome.keyring` (used for OAuth tokens). *(Note: Allows processes inside the sandbox to query unlocked keyring credentials, so only enable it on profiles that strictly require host keyring integration).*
-  * `dbus_notifications = true`: Filters and exposes `org.freedesktop.Notifications`, allowing desktop notifications (e.g. `notify-send`) without granting any credential or keyring access.
-* **Nested User Namespace Blocking (`--disable-userns`):** Processes inside the sandbox cannot create further user namespaces, closing off the kernel attack surface (netfilter, mounts, etc.) that unprivileged user namespaces expose to local privilege escalation exploits. Lifted only by `--allow-userns` or `allow_userns = true`.
-* **Process Termination Assurance (`--die-with-parent`):** If the parent shell or terminal terminates, the Linux kernel terminates every subprocess inside the sandbox namespace.
-* **Automatic Resource Cleanup:** A bash `trap` cleans up the `xdg-dbus-proxy` and `net-proxy.py` background processes and removes temporary directories (`/tmp/bwrap-dbus-*`, `/tmp/bwrap-net-*`) upon exit.
-* **Declarative Per-Profile Secret Scoping:** The sandbox runs `--clearenv` to scrub all host environment variables. Unlike traditional wrappers that unconditionally pass all API keys whenever network is enabled, `bwrap-sandbox` inspects the active profiles defined in `profiles.conf` and injects *only* the specific variables declared for those profiles (supporting exact names and wildcards). Toolchains, build runners, and unselected agents run with zero exposed keys.
-* **Opt-in Workspace Symlink Resolution (`--resolve-symlinks`):** External symlink targets are never mounted implicitly. When requested, targets are mounted read-only by default, while paths listed in the configurable `symlink-blocklist.txt` (credentials, shell startup files, system paths, etc.), sockets and any directory containing them are always refused (see [example 7](#7-resolve-workspace-symlinks-pointing-outside-the-project)).
-* **Checked Profile Symlinks:** Symlinks inside profile mounts that point elsewhere (e.g. `~/.claude/settings.json -> ~/dotfiles/claude/settings.json`) have their targets mounted read-only so they keep working. Since an agent can plant such links in a read-write mount (e.g. `~/.claude/x -> ~`) to have them mounted in a later session, the targets go through the same rules as `--resolve-symlinks`: blocklisted paths, directories containing them or the workspace, and targets containing sockets, devices or FIFOs are refused with a warning (and none are resolved if `symlink-blocklist.txt` is missing). Paths named directly in `mount` entries are trusted. Use `--log-level debug` to list every resolved target.
-* **Usr-Merge Compatibility:** Automatically identifies and maps relative symlinks for `/bin`, `/sbin`, `/lib`, and `/lib64`, preventing mount failure on modern Debian, Ubuntu, and Arch Linux distributions.
+* **Filtered network (`-nf`):** the sandbox keeps its own network namespace (`--unshare-net`). Inside, a relay on `127.0.0.1:18080` (socat or Python) forwards to a Unix socket mounted from the host, where `net-proxy.py` checks each request against `allowed-domains.txt`. `HTTP_PROXY`/`HTTPS_PROXY` point at the relay. Domains or ports not on the list get `403 Forbidden`, and direct TCP/UDP connections fail with `Network is unreachable`. Host services are reachable only when listed explicitly, e.g. `localhost:11434` for Ollama, `127.0.0.1:8000,8080`, or ranges such as `3000-3010`.
 
----
-
-## Best Practices for Agent Usage
-
-1. **Prefer `--net-filtered` (`-nf`) over `--net`:** Use `-nf` as your default network mode for AI agents. It protects your local network, blocks arbitrary telemetry/exfiltration, and limits token usage to whitelisted endpoints.
-2. **Development vs. Production Secrets:** Never export production tokens into your terminal before launching the sandbox. Rely on local `.env.development` files or pass test keys with hard spending limits.
-3. **Commit Verification:** While the sandbox prevents unauthorized host modification, inspect file changes (`git status`, `git diff`) from your host terminal before committing code generated by the agent.
+  The proxy only sees the host and port the client asks for. Traffic inside an allowed `CONNECT` tunnel (TLS SNI, the inner `Host` header, any protocol on an allowed port) is not inspected, so a whitelisted CDN or shared hosting platform can relay requests to other sites it serves (domain fronting). On shared platforms, list specific hostnames rather than wildcards. Request heads must arrive within 30 seconds and have at most 100 header lines; upstream connections time out after 15 seconds; established tunnels have no idle timeout.
+* **Git SSH remotes under `-nf`:** SSH (port 22) cannot go through an HTTP proxy, so with `-nf` `GIT_CONFIG_PARAMETERS` rewrites `git@github.com:` and `git@gitlab.com:` to `https://`, and `git clone`/`git fetch` go through the proxy.
+* **Git metadata:** Git on the host runs hooks and commands taken from config (`core.fsmonitor`, `core.pager`, `diff.external`, `credential.helper`, ...), so a poisoned repository would run code outside the sandbox the next time you type `git status`. For the workspace repository, its linked worktrees (`.git/worktrees/*`) and its submodules (`.git/modules/**`), the files `hooks/`, `config`, `config.worktree`, `commondir` and `gitdir` are mounted read-only, and every git directory is mounted onto itself so it cannot be renamed or replaced. Objects, refs, the index and logs stay writable, so the agent can commit, branch and fetch. Since `<gitdir>/commondir` could redirect Git to config and hooks elsewhere, a harmless placeholder containing `./` is created in each repository and left there (Git only reports the common directory as an absolute path, e.g. in `git rev-parse --git-common-dir`); if an existing `commondir` points anywhere else, the sandbox refuses to start. Not covered: a repository the agent initializes during the session (a warning is shown on exit) and nested repositories it creates inside the workspace, so only run Git on the host in directories you expect to be repositories.
+* **D-Bus:** handing the raw session bus to a sandbox lets it ask `systemd --user` to run commands outside every namespace. Profiles that need D-Bus get their own `xdg-dbus-proxy` that allows only the requested names:
+  * `dbus_auth = true` exposes `org.freedesktop.secrets` and `org.gnome.keyring`. Anything in the sandbox can then read unlocked keyring secrets, so enable it only where host keyring integration is required.
+  * `dbus_notifications = true` exposes `org.freedesktop.Notifications`, with no keyring access.
+* **Nested user namespaces (`--disable-userns`):** blocked unless `--allow-userns` or `allow_userns = true` is used. This keeps netfilter, mounts and other kernel interfaces that user namespaces open to unprivileged users out of reach.
+* **Environment:** `--clearenv` removes every host variable; locale, terminal and proxy variables are set explicitly, and the rest comes only from the active profiles' `env` and `setenv` directives (see [Environment variables](#environment-variables)).
+* **Profile symlinks:** symlinks inside profile mounts that point elsewhere (e.g. `~/.claude/settings.json -> ~/dotfiles/claude/settings.json`) have their targets mounted read-only so they keep working. Since an agent could plant such a link in a writable mount (e.g. `~/.claude/x -> ~`) to get it mounted in a later session, targets go through the same rules as `--resolve-symlinks`: blocklisted paths, directories containing them or the workspace, and targets containing sockets, devices or FIFOs are refused with a warning (and none are resolved if `symlink-blocklist.txt` is missing). Paths named directly in `mount` entries are trusted. `--log-level debug` lists every resolved target.
+* **Process lifetime:** `--die-with-parent` kills everything in the sandbox if the script exits. On exit, a `trap` stops `xdg-dbus-proxy` and `net-proxy.py` and removes the temporary directories (`/tmp/bwrap-rt-*`, `/tmp/bwrap-dbus-*`, `/tmp/bwrap-net-*`).
+* **usr-merge:** `/bin`, `/sbin`, `/lib` and `/lib64` are recreated as symlinks when they are symlinks on the host, so the sandbox works on both merged and split layouts.
 
 ---
 
-## Contributing & Disclaimer
+## Recommendations
 
-Contributions, feedback, and security reviews are warmly welcome!
+1. **Use `-nf` by default.** It keeps the agent away from your LAN and host services and limits where data can be sent.
+2. **Keep production secrets out of the shell** you launch the sandbox from. Forwarded variables are visible to everything the agent runs; prefer test keys with spending limits.
+3. **Review changes from the host** (`git status`, `git diff`) before committing or pushing what the agent wrote.
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome, especially reports of sandbox escapes, permission bypasses, problems on specific distributions, and suggestions for tighter default profiles or whitelists.
 
 > [!NOTE]
-> **Honest Disclaimer:** I am not a cybersecurity specialist or kernel isolation expert. A major portion of this project was vibecoded alongside AI coding agents to solve a real practical need.
->
-> If you notice potential sandbox escapes, permission bypasses, edge cases on your Linux distribution, or have suggestions for tighter default profiles and domain whitelists, please open an issue or submit a pull request! All ideas and improvements are appreciated.
+> I am not a security specialist, and much of this project was written with the help of AI coding agents. Treat it as a useful layer of defense, not a guarantee, and please report anything that looks wrong.
 
 ---
 
 ## License
 
-This project is licensed under the terms of the [GNU General Public License v3.0 (GPLv3)](LICENSE).
-
-
+[GNU General Public License v3.0](LICENSE).
