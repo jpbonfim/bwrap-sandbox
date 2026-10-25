@@ -11,6 +11,7 @@ ALLOW_NET=false
 ALLOW_NET_FILTERED=false
 ALLOW_GUI=false                # Enabled by --gui or by any active profile ('gui = true')
 ALLOW_USERNS=false             # Enabled by --allow-userns or by any active profile ('allow_userns = true')
+FORWARD_TERMINAL_ENV=false     # Enabled by --terminal-env or by any active profile ('terminal_env = true')
 RESOLVE_SYMLINKS=""            # "" (disabled) | "ro" | "rw"
 WHITELIST_FILE=""
 TARGET_DIR="$(pwd)"
@@ -474,6 +475,8 @@ apply_profile_from_config() {
                 ALLOW_GUI=true
             elif [[ "$line" =~ ^allow_userns[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
                 ALLOW_USERNS=true
+            elif [[ "$line" =~ ^terminal_env[[:space:]]*=[[:space:]]*(true|yes|1)$ ]]; then
+                FORWARD_TERMINAL_ENV=true
             fi
         fi
     done < "$file"
@@ -635,6 +638,8 @@ Options:
   -g, --gui                Expose X11/Wayland display and clipboard (Warning: reduces isolation)
       --allow-userns       Allow nested user namespaces, e.g. for Chrome's own sandbox
                            (Warning: exposes more kernel attack surface)
+      --terminal-env       Forward host terminal identification and color variables
+                           (TERM_PROGRAM, VTE_VERSION, LS_COLORS, TERMINFO, etc.)
       --resolve-symlinks[=ro|rw]
                            Mount targets of workspace symlinks pointing outside the project
                            ('read'/'write' are aliases; Default: ro; paths listed in
@@ -763,6 +768,10 @@ while [[ $# -gt 0 ]]; do
         ;;
     --allow-userns)
         ALLOW_USERNS=true
+        shift
+        ;;
+    --terminal-env)
+        FORWARD_TERMINAL_ENV=true
         shift
         ;;
     --log-level)
@@ -1370,8 +1379,31 @@ BWRAP_ENV=(
     "--setenv" "GIT_CONFIG_PARAMETERS" "$GIT_CONFIG_OVERRIDE"
 )
 
-if [ -n "${COLORTERM:-}" ]; then
-    BWRAP_ENV+=("--setenv" "COLORTERM" "$COLORTERM")
+# Terminal identification and color preferences (--terminal-env or 'terminal_env = true').
+# They only describe the host terminal, and tools inside the sandbox rely on them to
+# pick color depth, color themes and hyperlink (OSC 8) handling the same way they do
+# on the host. TMUX/TMUX_PANE only identify the multiplexer: the tmux server socket
+# lives in the host /tmp, which the sandbox replaces with a private tmpfs, so it
+# stays unreachable. KITTY_* is left out because it refers to kitty remote control.
+if [ "$FORWARD_TERMINAL_ENV" = true ]; then
+    TERMINAL_ENV_VARS=(
+        "COLORTERM" "TERM_PROGRAM" "TERM_PROGRAM_VERSION" "TMUX" "TMUX_PANE"
+        "VTE_VERSION" "KONSOLE_VERSION" "WT_SESSION"
+        "COLORFGBG" "LS_COLORS" "NO_COLOR" "FORCE_COLOR" "FORCE_HYPERLINK"
+        "CLICOLOR" "CLICOLOR_FORCE"
+    )
+    for var in "${TERMINAL_ENV_VARS[@]}"; do
+        if [ -n "${!var:-}" ]; then
+            BWRAP_ENV+=("--setenv" "$var" "${!var}")
+        fi
+    done
+
+    # Terminals such as kitty ship their own terminfo entry outside the system
+    # database; without it, TERM=xterm-kitty cannot be resolved inside the sandbox.
+    if [ -n "${TERMINFO:-}" ] && [ -d "$TERMINFO" ]; then
+        BWRAP_ARGS+=("--ro-bind" "$TERMINFO" "$TERMINFO")
+        BWRAP_ENV+=("--setenv" "TERMINFO" "$TERMINFO")
+    fi
 fi
 
 # ------------------------------------------------------------------------------
