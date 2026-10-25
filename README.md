@@ -322,6 +322,13 @@ To prevent credential leakage and uphold the principle of least privilege, envir
 * Running `./bwrap-sandbox.sh -p claude,openai -- my-script` passes both the Anthropic variables and `OPENAI_API_KEY`.
 * Profiles support wildcards (`env = ANTIGRAVITY_*`), forwarding all matching exported host variables.
 
+### Git Identity Inside the Sandbox
+
+`~/.gitconfig` is hidden like the rest of `$HOME`, so `git commit` fails inside the sandbox with `Author identity unknown`. Two options:
+
+* **Identity only (least exposure):** set it per profile with `setenv = GIT_AUTHOR_NAME=...`, `GIT_AUTHOR_EMAIL=...`, `GIT_COMMITTER_NAME=...` and `GIT_COMMITTER_EMAIL=...`.
+* **Whole file:** uncomment `mount = ro:~/.gitconfig` in the `claude` or `antigravity` profile. It is read-only, so the agent cannot plant aliases, pagers or credential helpers that would later run on the host (the sandbox also keeps `core.hooksPath=/dev/null` over it), but the agent can read everything in it. Check it first for tokens in URLs, `http.extraHeader`, `credential.helper` or `include.path` entries, e.g. `grep -nE 'token|password|extraheader|https?://[^/ ]*@|helper|include' ~/.gitconfig`.
+
 Inspect current profiles and descriptions:
 ```bash
 ./bwrap-sandbox.sh --list-profiles
