@@ -18,6 +18,12 @@ import socket
 import sys
 
 BUFFER_SIZE = 65536
+# Bounds on what a client can make the host-side proxy hold: time to send the request head,
+# number of header lines, and time to reach the upstream server. Established tunnels have no
+# idle timeout, since streaming responses and websockets can stay quiet for long periods.
+REQUEST_HEAD_TIMEOUT = 30
+MAX_HEADER_LINES = 100
+UPSTREAM_CONNECT_TIMEOUT = 15
 
 
 DEFAULT_HTTP_PORTS = {80, 443}
@@ -43,13 +49,18 @@ async def open_safe_connection(host, port):
     and connects directly to the validated IP to prevent TOCTOU DNS Rebinding attacks.
     """
     if host.lower() in LOCAL_HOSTS:
-        return await asyncio.open_connection("127.0.0.1", port)
+        return await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), UPSTREAM_CONNECT_TIMEOUT)
 
     loop = asyncio.get_running_loop()
     try:
-        addr_info = await loop.getaddrinfo(host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+        addr_info = await asyncio.wait_for(
+            loop.getaddrinfo(host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM),
+            UPSTREAM_CONNECT_TIMEOUT,
+        )
     except socket.gaierror as e:
         raise ConnectionError(f"DNS resolution failed for {host}: {e}")
+    except asyncio.TimeoutError:
+        raise ConnectionError(f"DNS resolution timed out for {host}")
 
     safe_ips = []
     for item in addr_info:
@@ -74,7 +85,9 @@ async def open_safe_connection(host, port):
     last_exc = None
     for ip_str in safe_ips:
         try:
-            return await asyncio.open_connection(ip_str, port)
+            return await asyncio.wait_for(asyncio.open_connection(ip_str, port), UPSTREAM_CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            last_exc = ConnectionError(f"Connection to {ip_str}:{port} timed out")
         except Exception as e:
             last_exc = e
 
@@ -217,6 +230,25 @@ def is_allowed(target_host, target_port, rules):
     return False
 
 
+async def read_request_head(reader):
+    """
+    Reads the request line and the header lines, without the blank line that ends them.
+    Raises ValueError when the client sends more than MAX_HEADER_LINES header lines.
+    """
+    req_line = await reader.readline()
+    header_lines = []
+    if not req_line:
+        return req_line, header_lines
+    while True:
+        line = await reader.readline()
+        if not line or line in (b"\r\n", b"\n"):
+            break
+        if len(header_lines) >= MAX_HEADER_LINES:
+            raise ValueError(f"Request head exceeds {MAX_HEADER_LINES} header lines")
+        header_lines.append(line)
+    return req_line, header_lines
+
+
 async def pipe(reader, writer):
     try:
         while True:
@@ -241,7 +273,8 @@ class FilteringProxyServer:
 
     async def handle_client(self, client_r, client_w):
         try:
-            req_line = await client_r.readline()
+            # Slow, endless or oversized request heads are dropped (the connection is closed below)
+            req_line, header_lines = await asyncio.wait_for(read_request_head(client_r), REQUEST_HEAD_TIMEOUT)
             if not req_line:
                 client_w.close()
                 return
@@ -257,12 +290,6 @@ class FilteringProxyServer:
             if method == "CONNECT":
                 # CONNECT host:port HTTP/1.1
                 host, port = parse_host_port(target, default_port=443)
-
-                # Read remaining request headers
-                while True:
-                    hdr = await client_r.readline()
-                    if not hdr or hdr in (b"\r\n", b"\n"):
-                        break
 
                 if not is_allowed(host, port, self.rules):
                     body = f"Blocked by sandbox filter: {host}:{port}\n"
@@ -324,10 +351,7 @@ class FilteringProxyServer:
                 # Plain HTTP (GET http://host:port/path HTTP/1.1)
                 headers = [req_line]
                 host_hdr = ""
-                while True:
-                    hdr = await client_r.readline()
-                    if not hdr or hdr in (b"\r\n", b"\n"):
-                        break
+                for hdr in header_lines:
                     if hdr.lower().startswith(b"host:"):
                         host_hdr = hdr.decode("utf-8", "replace").split(":", 1)[1].strip()
                     elif not hdr.lower().startswith(b"connection:") and not hdr.lower().startswith(b"proxy-connection:"):
