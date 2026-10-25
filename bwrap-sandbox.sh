@@ -1228,9 +1228,14 @@ is_redundant_file_mount() {
     return 1
 }
 
-DETECTED_USER_PATHS=()
+# bwrap applies mounts in order and a later mount hides everything below its path, so a parent
+# registered after one of its children (e.g. a 'protect' listed before the rw mount containing
+# it, or across profiles) would make the child writable again. Sorting the paths (byte order)
+# always places a parent before its children.
+mapfile -d '' SORTED_MOUNT_PATHS < <(printf '%s\0' "${ORDERED_MOUNT_PATHS[@]}" | LC_ALL=C sort -z)
 
-for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
+for target_path in "${SORTED_MOUNT_PATHS[@]}"; do
+    [ -z "$target_path" ] && continue # No profile mounts
     mode="${MOUNT_PERMS["$target_path"]}"
     if is_redundant_file_mount "$target_path"; then
         log_debug "Skipping redundant mount [$mode] $target_path (covered by a parent directory mount)"
@@ -1243,7 +1248,16 @@ for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
         BWRAP_ARGS+=("--ro-bind" "$target_path" "$target_path")
     elif [ "$mode" = "tmpfs" ]; then
         BWRAP_ARGS+=("--tmpfs" "$target_path")
-        continue # Starts empty, so it never contributes executables to PATH
+    fi
+done
+
+# PATH entries keep the registration order, so profiles decide which toolchain takes precedence
+DETECTED_USER_PATHS=()
+
+for target_path in "${ORDERED_MOUNT_PATHS[@]}"; do
+    # tmpfs mounts start empty, so they never contribute executables to PATH
+    if [ "${MOUNT_PERMS["$target_path"]}" = "tmpfs" ] || is_redundant_file_mount "$target_path"; then
+        continue
     fi
 
     path_entry=""
