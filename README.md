@@ -335,7 +335,7 @@ session D-Bus ──▶ xdg-dbus-proxy ───────────▶ keyr
 allowed domains ◀── net-proxy.py ◀── unix socket ◀── relay on 127.0.0.1:18080 ◀── app
 ```
 
-* **Filesystem:** only the paths above exist. Symlinks inside profile mounts are resolved under the same blocklist as `--resolve-symlinks`.
+* **Filesystem:** only the paths above exist. Symlinks inside profile mounts are resolved under the same blocklist as `--resolve-symlinks`; their targets are mounted read-only one by one, so tools that save them by replacing the file (e.g. Claude Code's `settings.json` via `/model`) fail with `EBUSY`. Edit those files on the host.
 * **Network:** none by default. With `-nf`, `HTTP_PROXY` points to the in-sandbox relay, the host-side proxy allows only the `host:port` pairs in `allowed-domains.txt`, and any other connection fails. Tunnels to allowed hosts are not inspected, so list specific hostnames instead of wildcards on shared platforms. `--net` shares the host network instead.
 * **Git:** hooks, `config`, `commondir` and `gitdir` of the repository, its worktrees and submodules are read-only; objects, refs and the index stay writable (with `--protect-branches`, only the workspace's branch and new ones). A `commondir` placeholder containing `./` is left in each repository. With `-nf`, GitHub and GitLab SSH remotes are rewritten to HTTPS. Repositories created during the session are not protected.
 * **D-Bus:** a single `xdg-dbus-proxy` exposes only the services enabled by the profiles; `systemd --user` and everything else on the bus stay unreachable.
