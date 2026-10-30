@@ -13,6 +13,7 @@ ALLOW_GUI=false                # Enabled by --gui or by any active profile ('gui
 ALLOW_USERNS=false             # Enabled by --allow-userns or by any active profile ('allow_userns = true')
 FORWARD_TERMINAL_ENV=false     # Enabled by --terminal-env or by any active profile ('terminal_env = true')
 RESOLVE_SYMLINKS=""            # "" (disabled) | "ro" | "rw"
+PROTECT_BRANCHES=false         # Enabled by --protect-branches
 WHITELIST_FILE=""
 TARGET_DIR="$(pwd)"
 SELECTED_PROFILES=()
@@ -668,6 +669,8 @@ Options:
                            Mount targets of workspace symlinks pointing outside the project
                            ('read'/'write' are aliases; Default: ro; paths listed in
                            symlink-blocklist.txt are never mounted)
+      --protect-branches   Make every local Git branch but the workspace's read-only, and the
+                           HEADs of the other worktrees (an agent cannot move or delete them)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
       --log-level LEVEL    Log verbosity: error, warn, info or debug (Default: info; errors are always shown)
@@ -683,6 +686,7 @@ Examples:
   $(basename "$0") -p dev-tools,claude -nf -w ./my-domains.txt -- claude
   $(basename "$0") -p dev-tools --net -- cargo build
   $(basename "$0") -p dev-tools,claude -nf --resolve-symlinks -- claude
+  $(basename "$0") -p dev-tools,claude -nf --protect-branches -d ../my-worktree -- claude
 EOF
     exit 0
 }
@@ -822,6 +826,10 @@ while [[ $# -gt 0 ]]; do
                 exit 1
                 ;;
         esac
+        shift
+        ;;
+    --protect-branches)
+        PROTECT_BRANCHES=true
         shift
         ;;
     -w | --whitelist)
@@ -1466,9 +1474,15 @@ WORKSPACE_HAD_GIT=false
 if [ -e "$TARGET_DIR/.git" ] || [ -L "$TARGET_DIR/.git" ]; then
     WORKSPACE_HAD_GIT=true
 fi
+# The git directory of the workspace and the common one of its repository (the same for a repository's
+# own checkout), once found below
+WORKSPACE_GIT_DIR=""
+WORKSPACE_GIT_COMMON_DIR=""
 
 if [ -d "$TARGET_DIR/.git" ]; then
     protect_git_repository "$TARGET_DIR/.git"
+    WORKSPACE_GIT_DIR="$TARGET_DIR/.git"
+    WORKSPACE_GIT_COMMON_DIR="$TARGET_DIR/.git"
 elif [ -f "$TARGET_DIR/.git" ]; then
     # Git worktree or submodule pointer file
     BWRAP_ARGS+=("--ro-bind" "$TARGET_DIR/.git" "$TARGET_DIR/.git")
@@ -1508,6 +1522,8 @@ elif [ -f "$TARGET_DIR/.git" ]; then
             # worktree-specific gitdir, which usually lives in its 'worktrees/' directory
             if [ -d "$COMMON_GITDIR" ]; then
                 protect_git_repository "$COMMON_GITDIR"
+                WORKSPACE_GIT_DIR="$WT_GITDIR"
+                WORKSPACE_GIT_COMMON_DIR="$COMMON_GITDIR"
             fi
             if [ "$WT_GITDIR" != "$COMMON_GITDIR" ] && [[ "$WT_GITDIR" != "$COMMON_GITDIR"/worktrees/* ]]; then
                 worktree_config=false
@@ -1515,6 +1531,102 @@ elif [ -f "$TARGET_DIR/.git" ]; then
                 protect_git_dir "$WT_GITDIR" "linked-worktree" "$worktree_config"
             fi
         fi
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# Branch Protection (--protect-branches)
+# The worktrees of a repository share its refs, so an agent working in one could move or delete any
+# branch (e.g. 'git branch -f main <commit>'), and host-side work would then build on its commits.
+# Every local branch but the one checked out in the workspace is mounted read-only as a loose ref:
+# Git can neither update it (renaming its lock file over a mount point fails) nor delete it, while
+# creating branches, committing on the workspace branch and fetching keep working. A branch only in
+# packed-refs gets its loose ref written first (the same value, as Git would write it). The HEADs of
+# the other worktrees are protected the same way, so their checkouts stay as they are.
+# A branch updated on the host during the session keeps its old value inside the sandbox.
+# ------------------------------------------------------------------------------
+
+# Prints "<refname> <object id>" for each local branch: the loose refs, then the packed ones without
+# a loose ref (read from the files, without running Git on the repository)
+# Usage: list_local_branches <common gitdir>
+list_local_branches() {
+    local common_dir="$1" ref_file refname object_id
+    local -A seen=()
+    if [ -d "$common_dir/refs/heads" ]; then
+        while IFS= read -r -d '' ref_file; do
+            refname="${ref_file#"$common_dir"/}"
+            object_id=""
+            IFS= read -r object_id < "$ref_file" || true
+            seen["$refname"]=1
+            printf '%s %s\n' "$refname" "$object_id"
+        done < <(find "$common_dir/refs/heads" -type f ! -name '*.lock' -print0 2>/dev/null)
+    fi
+    if [ -f "$common_dir/packed-refs" ]; then
+        while read -r object_id refname; do
+            case "$refname" in refs/heads/*) ;; *) continue ;; esac
+            [ -n "${seen["$refname"]:-}" ] || printf '%s %s\n' "$refname" "$object_id"
+        done < <(grep -v '^[#^]' "$common_dir/packed-refs")
+    fi
+}
+
+# Writes the loose ref of a packed branch, refusing names or paths that lead outside refs/heads
+# (the files could have been planted by an earlier session); returns 1 when it was refused
+# Usage: write_loose_ref <common gitdir> <refname> <object id>
+write_loose_ref() {
+    local common_dir="$1" refname="$2" object_id="$3" ref_file heads_dir temporary
+    ref_file="$common_dir/$refname"
+    heads_dir="$(realpath -m "$common_dir/refs/heads")"
+    if ! [[ "$object_id" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] ||
+        ! git check-ref-format "$refname" 2>/dev/null ||
+        ! path_within "$heads_dir" "$(realpath -m "$ref_file")"; then
+        return 1
+    fi
+    mkdir -p "$(dirname "$ref_file")" || return 1
+    temporary="$(mktemp "$common_dir/.protected-ref.XXXXXX")" || return 1  # outside refs/: never read as a ref
+    printf '%s\n' "$object_id" > "$temporary" && mv -f "$temporary" "$ref_file"
+}
+
+# Usage: protect_git_branches <workspace gitdir> <common gitdir>
+protect_git_branches() {
+    local git_dir="$1" common_dir="$2" head="" own_ref="" refname object_id ref_file checkout_dir
+    local -i protected=0
+    if [ "$(git config --file "$common_dir/config" --get extensions.refStorage 2>/dev/null)" = "reftable" ]; then
+        log_warn "The repository stores its refs in a reftable: its branches are not protected."
+        return 0
+    fi
+    IFS= read -r head < "$git_dir/HEAD" 2>/dev/null || true
+    [[ "$head" == "ref: refs/heads/"* ]] && own_ref="${head#ref: }"
+
+    while read -r refname object_id; do
+        [ "$refname" = "$own_ref" ] && continue
+        ref_file="$common_dir/$refname"
+        if [ ! -e "$ref_file" ] && ! write_loose_ref "$common_dir" "$refname" "$object_id"; then
+            log_warn "Branch '${refname#refs/heads/}' is not protected: its packed ref looks tampered with."
+            continue
+        fi
+        if [ -L "$ref_file" ] || [ ! -f "$ref_file" ]; then
+            log_warn "Branch '${refname#refs/heads/}' is not protected: its ref is not a regular file."
+            continue
+        fi
+        BWRAP_ARGS+=("--ro-bind" "$ref_file" "$ref_file")
+        protected+=1
+    done < <(list_local_branches "$common_dir")
+
+    # The HEADs of the other checkouts: the repository's own (or the bare HEAD) and the other worktrees
+    for checkout_dir in "$common_dir" "$common_dir"/worktrees/*/; do
+        checkout_dir="${checkout_dir%/}"
+        if [ "$checkout_dir" != "$git_dir" ] && [ -f "$checkout_dir/HEAD" ] && [ ! -L "$checkout_dir/HEAD" ]; then
+            BWRAP_ARGS+=("--ro-bind" "$checkout_dir/HEAD" "$checkout_dir/HEAD")
+        fi
+    done
+    log_info "[+] Protected $protected Git branch(es)${own_ref:+ (writable: ${own_ref#refs/heads/})}"
+}
+
+if [ "$PROTECT_BRANCHES" = true ]; then
+    if [ -n "$WORKSPACE_GIT_DIR" ] && [ -n "$WORKSPACE_GIT_COMMON_DIR" ]; then
+        protect_git_branches "$WORKSPACE_GIT_DIR" "$WORKSPACE_GIT_COMMON_DIR"
+    else
+        log_debug "--protect-branches: the workspace is not the top of a Git checkout"
     fi
 fi
 

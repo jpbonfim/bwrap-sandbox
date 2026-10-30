@@ -155,6 +155,8 @@ Options:
                            Mount targets of workspace symlinks pointing outside the project
                            ('read'/'write' are aliases; Default: ro; paths listed in
                            symlink-blocklist.txt are never mounted)
+      --protect-branches   Make every local Git branch but the workspace's read-only, and the
+                           HEADs of the other worktrees (an agent cannot move or delete them)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
       --log-level LEVEL    Log verbosity: error, warn, info or debug (Default: info; errors are always shown)
@@ -262,6 +264,20 @@ Each mounted or refused link is reported at startup (`[+] Resolved workspace sym
 > [!WARNING]
 > A repository can contain symlinks to sensitive host paths, and the blocklist is best-effort. Use `--resolve-symlinks` only on projects you trust, check the startup report, and prefer `ro`.
 
+### 8. An agent in a Git worktree, unable to touch your other branches
+
+The worktrees of a repository share its branches, so an agent working in one could move or delete any of them (`git branch -f main <commit>`, `git update-ref`, `git push . HEAD:main`). `--protect-branches` mounts every local branch but the one checked out in the workspace read-only, and the `HEAD` of every other checkout:
+
+```bash
+./bwrap-sandbox.sh -p dev-tools,claude -nf --protect-branches -d ~/projects/app/fix-login -- claude
+```
+
+* **Still works:** committing on the workspace's branch, creating branches, fetching, rebasing the workspace's branch onto another.
+* **Refused by Git** (`Device or resource busy`): updating or deleting any other branch, switching another worktree to a different branch.
+* A branch kept only in `packed-refs` gets its loose ref written on the host first, with the same value. Names or paths that would lead outside `refs/heads` are not written, and their branch is reported as not protected.
+* A branch you update on the host during the session keeps its old value inside the sandbox until the agent restarts.
+* Repositories using the reftable format are not supported: a warning is shown and nothing is protected.
+
 ---
 
 ## Bundled profiles
@@ -319,7 +335,7 @@ allowed domains ◀── net-proxy.py ◀── unix socket ◀── relay on 
 
 * **Filesystem:** only the paths above exist. Symlinks inside profile mounts are resolved under the same blocklist as `--resolve-symlinks`.
 * **Network:** none by default. With `-nf`, `HTTP_PROXY` points to the in-sandbox relay, the host-side proxy allows only the `host:port` pairs in `allowed-domains.txt`, and any other connection fails. Tunnels to allowed hosts are not inspected, so list specific hostnames instead of wildcards on shared platforms. `--net` shares the host network instead.
-* **Git:** hooks, `config`, `commondir` and `gitdir` of the repository, its worktrees and submodules are read-only; objects, refs and the index stay writable. A `commondir` placeholder containing `./` is left in each repository. With `-nf`, GitHub and GitLab SSH remotes are rewritten to HTTPS. Repositories created during the session are not protected.
+* **Git:** hooks, `config`, `commondir` and `gitdir` of the repository, its worktrees and submodules are read-only; objects, refs and the index stay writable (with `--protect-branches`, only the workspace's branch and new ones). A `commondir` placeholder containing `./` is left in each repository. With `-nf`, GitHub and GitLab SSH remotes are rewritten to HTTPS. Repositories created during the session are not protected.
 * **D-Bus:** a single `xdg-dbus-proxy` exposes only the services enabled by the profiles; `systemd --user` and everything else on the bus stay unreachable.
 * **Processes:** private PID namespace, new session (no `TIOCSTI`), no nested user namespaces (unless `--allow-userns`), and everything is killed when the script exits.
 * **Environment:** starts empty (`--clearenv`); only locale, terminal, proxy and profile variables are set.
