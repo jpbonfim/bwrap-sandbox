@@ -14,6 +14,7 @@ ALLOW_USERNS=false             # Enabled by --allow-userns or by any active prof
 FORWARD_TERMINAL_ENV=false     # Enabled by --terminal-env or by any active profile ('terminal_env = true')
 RESOLVE_SYMLINKS=""            # "" (disabled) | "ro" | "rw"
 PROTECT_BRANCHES=false         # Enabled by --protect-branches
+EXTRA_MOUNTS=()                # "<ro|rw>:<path>" from --mount, applied after the profiles
 WHITELIST_FILE=""
 TARGET_DIR="$(pwd)"
 SELECTED_PROFILES=()
@@ -671,6 +672,8 @@ Options:
                            symlink-blocklist.txt are never mounted)
       --protect-branches   Make every local Git branch but the workspace's read-only, and the
                            HEADs of the other worktrees (an agent cannot move or delete them)
+  -m, --mount MODE:PATH    Mount an existing path read-only (ro) or read-write (rw), as a profile's
+                           'mount' directive does (repeatable; applied after the profiles)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
       --log-level LEVEL    Log verbosity: error, warn, info or debug (Default: info; errors are always shown)
@@ -687,6 +690,7 @@ Examples:
   $(basename "$0") -p dev-tools --net -- cargo build
   $(basename "$0") -p dev-tools,claude -nf --resolve-symlinks -- claude
   $(basename "$0") -p dev-tools,claude -nf --protect-branches -d ../my-worktree -- claude
+  $(basename "$0") -p dev-tools,claude -nf -m rw:~/.local/state/my-tool/inbox -- claude
 EOF
     exit 0
 }
@@ -831,6 +835,18 @@ while [[ $# -gt 0 ]]; do
     --protect-branches)
         PROTECT_BRANCHES=true
         shift
+        ;;
+    -m | --mount)
+        if [[ $# -lt 2 || "$2" == "--" ]]; then
+            echo "Error: Option '$1' requires an argument." >&2
+            exit 1
+        fi
+        if ! [[ "$2" =~ ^(ro|rw):.+$ ]]; then
+            echo "Error: Invalid value '$2' for '$1' (expected 'ro:<path>' or 'rw:<path>')." >&2
+            exit 1
+        fi
+        EXTRA_MOUNTS+=("$2")
+        shift 2
         ;;
     -w | --whitelist)
         if [[ $# -lt 2 || "$2" == "--" ]]; then
@@ -1014,6 +1030,15 @@ BWRAP_ARGS+=(
 # ------------------------------------------------------------------------------
 for profile in "${SELECTED_PROFILES[@]}"; do
     apply_profile "$profile"
+done
+
+for extra_mount in "${EXTRA_MOUNTS[@]}"; do
+    extra_path="$(expand_path "${extra_mount#*:}")"
+    if [ ! -e "$extra_path" ]; then
+        log_warn "Skipping --mount '${extra_mount}': '$extra_path' does not exist."
+        continue
+    fi
+    set_mount "${extra_mount%%:*}" "$extra_path"
 done
 
 # Nested user namespaces are blocked unless requested via --allow-userns or 'allow_userns = true'

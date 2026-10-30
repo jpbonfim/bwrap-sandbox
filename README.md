@@ -157,13 +157,15 @@ Options:
                            symlink-blocklist.txt are never mounted)
       --protect-branches   Make every local Git branch but the workspace's read-only, and the
                            HEADs of the other worktrees (an agent cannot move or delete them)
+  -m, --mount MODE:PATH    Mount an existing path read-only (ro) or read-write (rw), as a profile's
+                           'mount' directive does (repeatable; applied after the profiles)
   -w, --whitelist PATH     Domain whitelist file (Default: allowed-domains.txt)
   -d, --dir PATH           Target workspace directory (Default: current directory)
       --log-level LEVEL    Log verbosity: error, warn, info or debug (Default: info; errors are always shown)
   -h, --help               Show this help message
 ```
 
-Everything after `--` is the command to run inside the sandbox; without it, an interactive shell starts. The workspace cannot be `$HOME` or any directory containing it (such as `/home` or `/`), a system directory (`/usr`, `/etc`, `/run`, ...) or a shared root such as `/tmp`, `/opt` or `/mnt`.
+A path needed by one run only (e.g. a directory of its own for one agent) is mounted with `--mount`, without a profile. Everything after `--` is the command to run inside the sandbox; without it, an interactive shell starts. The workspace cannot be `$HOME` or any directory containing it (such as `/home` or `/`), a system directory (`/usr`, `/etc`, `/run`, ...) or a shared root such as `/tmp`, `/opt` or `/mnt`.
 
 `--log-level debug` lists the applied profiles and every mount with its mode; `warn` or `error` hides the informational output.
 
